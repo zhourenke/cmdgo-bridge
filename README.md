@@ -109,7 +109,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `maxTokens` | `64000` | 单次输出上限 |
 | `defaultContextWindow` | `1000000` | 模型无精确上下文时的兜底 |
 
-命令行参数:`--host <addr>`、`--port <port>`、`--data-dir <dir>`、`--help`。
+命令行参数:`--host <addr>`、`--port <port>`、`--data-dir <dir>`、`--help`。注意:`--host` / `--port` 会**写回 `config.json` 持久化**,下次启动继续生效。
 
 ## API 端点
 
@@ -143,6 +143,7 @@ mock 接受 `user_goodkey`(成功)/ `user_failkey`(403 测故障转移)/ `user_n
 | 对话报 `401 MISSING_CREDENTIAL` | 还没完成 OAuth 登录,先到控制台「发起登录」 |
 | 模型列表为空 | 目录来自 `https://api.commandcode.ai/provider/v1/models`(免鉴权),检查网络;日志会告警并 15 分钟后重试 |
 | 「重新连接 / 超时」 | 桥没在运行(关窗即停);或请求体超过 8MB 上限 | 
+| 连不上 11435(端口变了) | 检查 `~/.cmdgo-bridge/config.json` 的 `port`(`--port` 启动会写回并持久化) | 
 | 控制台登录后收不到回调 | 回调服务器绑定 `127.0.0.1:5959..5968`;浏览器与宿主不同机时需端口转发/SSH 隧道 |
 | 想排查问题 | 每次请求都记录在启动窗口与 `~/.cmdgo-bridge/access.log`(方法/路径/状态码/耗时),聊天另有 model/账号/结果明细 |
 
