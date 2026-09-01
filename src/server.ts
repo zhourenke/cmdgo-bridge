@@ -107,6 +107,10 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> 
 export function createBridgeServer(state: BridgeState): Server {
   const { cfg, credentials, pool, login } = state
 
+  // 池预热：账号池是懒加载的，不预读的话启动后的第一个请求会误报
+  // MISSING_CREDENTIAL（池 size=0，pick 不到账号）。立即加载一次。
+  void pool.list().catch(() => {})
+
   /** 模型目录实时视图；sync() 换入新目录后接口立刻可见。 */
   const holder: { current: BridgeModel[] } = { current: [] }
   const models = (): readonly BridgeModel[] => holder.current
