@@ -355,13 +355,15 @@ curl http://127.0.0.1:PORT/v1/chat/completions \
     }
 
     /* config */
+    var demo = /[?&]demo=1/.test(location.search);
+    var shownKey = demo ? 'sk-' + snap.apiKey.slice(0, 4) + '••••••••' : snap.apiKey;
     $('cfgEndpoint').textContent = snap.endpoint;
-    $('cfgApiKey').value = snap.apiKey;
+    $('cfgApiKey').value = shownKey;
     $('cfgRef').textContent = snap.credentialRef;
     document.querySelector('pre.curl').textContent =
       '# 任何 OpenAI 兼容客户端都可以用（Cherry Studio / Cline / Continue / Cursor 自定义供应商…）\n'
       + 'curl ' + snap.endpoint + '/chat/completions \\\n'
-      + '  -H "Authorization: Bearer ' + snap.apiKey + '" \\\n'
+      + '  -H "Authorization: Bearer ' + shownKey + '" \\\n'
       + '  -H "Content-Type: application/json" \\\n'
       + '  -d \'{"model":"' + (snap.modelIds[0] || '<模型ID>') + '","messages":[{"role":"user","content":"你好"}]}\'';
 

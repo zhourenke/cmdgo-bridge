@@ -1,75 +1,153 @@
 # cmdgo-bridge
 
-Command Code **Go 套餐**接入方案，仓库包含两部分：
+把 **Command Code Go 套餐**接入任意 Agent 工具的本地桥接服务。
 
-1. **[standalone/](./standalone/README.md)（推荐）**：独立桥接服务，不依赖 DSH——把只能用 CLI 网关的 Go 订阅包装成 OpenAI 兼容 API，任何 Agent 工具（Cherry Studio / Cline / ZCode / Cursor 等）都能接入，自带 Web 控制台（OAuth 登录、多账号池）。**新用户从这里开始。**
-2. **本目录**：原来的 DSH 插件（`dsh-cmdgo-provider`），把 Go 订阅接入 DSH 模型列表，文档如下。
+Command Code 的订阅分两种:标准 Provider API(OpenAI 兼容,任何工具可直连)和 **Go 套餐**($1/月)。Go 套餐调官方 OpenAI 端点返回 `403 upgrade_required`,只能走 CLI 私有网关 `POST /alpha/generate`。本项目把 Go 订阅包装成 **OpenAI 兼容 API**——Cherry Studio、Cline、Roo Code、Continue、Cursor、ZCode 等所有支持自定义 OpenAI 端点的工具都能直接用,自带 Web 控制台完成 OAuth 登录与多账号池管理。
 
----
+## 功能特性
 
-# dsh-cmdgo-provider（DSH 插件）
+- **OpenAI 兼容 API**:`POST /v1/chat/completions`(流式 / 非流式)、`GET /v1/models`,支持工具调用、`reasoning_effort`、`max_tokens`、`temperature` / `top_p`
+- **OAuth 登录**:控制台一键生成登录地址,浏览器授权后 API key 自动回收入池,免手动复制
+- **多账号池**:每完成一次登录新 key 自动成为独立账号,请求级 round-robin 摊薄额度;失败(401/403/429/5xx/网络错误)自动指数冷却并故障转移,绝不重放半截回答
+- **模型目录同步**:自动从官方目录拉取 Go 套餐可用模型(含 reasoning effort 元数据),15 分钟刷新
+- **自带 Web 控制台**:登录、凭据、账号池、模型列表一目了然,零配置上手
+- **零依赖桥**:无需 DSH / 任何框架,Node ≥ 20 即可运行,数据落盘在用户目录
 
-CommandCode **Go 套餐**（$1/mo）供应商插件：把只能用 `cmd` CLI 的 Go 订阅接入 DSH 模型列表，并把 `cmd login` 的 OAuth 登录提取成设置页里的专用登录选项。
+## 界面预览
 
-## 背景
+![控制台](assets/console.png)
 
-Command Code 的订阅分两种：
+## 快速开始
 
-1. **Provider API**：标准 OpenAI Chat 兼容端点，任何 harness 可直连。
-2. **Go 套餐**：调 Provider API 返回 `403 upgrade_required`，只能走 CLI 私有网关 `POST /alpha/generate`（自定义信封）。
+### 1. 前置条件
 
-本插件针对第二种情况。
+- **Node.js ≥ 20.3**(含 `npm`),验证:`node --version`
 
-## 安装
+### 2. 获取项目
 
 ```sh
-# npm（推荐）
-dsh plugin --profile web add dsh-cmdgo-provider
-
-# 或从 GitHub 安装
-dsh plugin --profile web add github:Patrick-mufeng/cmdgo-bridge
+git clone https://github.com/Patrick-mufeng/cmdgo-bridge.git
+cd cmdgo-bridge
 ```
 
-安装写入 profile 的依赖与 bundles 列表，**重启 harness 后由 bundles 正常装配**。装完：
+或者直接下载仓库 ZIP 并解压。
 
-1. 「Models」页选择 **Command Code Go** 供应商及模型；
-2. 「设置 → CommandCode Go」生成登录地址，浏览器授权后回调自动写入凭据。
+### 3. 安装依赖并构建
 
-## 功能
+```sh
+npm install
+npm run build
+```
 
-- **供应商注册**：启动后自动从 `/provider/v1/models` 拉取模型目录并按 Go 套餐规则筛选（开源模型 + 少量 premium 例外），定时刷新；reasoning effort 从官方 CLI catalog 合并。装完即可在 Web「Models」页选择 **Command Code Go** 供应商。
-- **OAuth 登录**：设置页新增「CommandCode Go」分区：
-  1. 第一个选项是**登录地址**——点击「生成登录地址」，host 在 `127.0.0.1:5959..5968` 起本机回调服务器，拼出 `https://commandcode.ai/studio/auth/cli?callback=…&state=…`；
-  2. 「打开登录页」→ 浏览器完成授权；
-  3. Studio 页面 POST `{apiKey, state, userId, userName, keyName}` 回本机 `/callback`，state 校验通过后 API Key 自动写入凭据存储（默认 `COMMANDCODE_API_KEY`），面板显示等待回调 → 已登录。
-- **HTTP API**：`GET /api/cmdgo/status`、`POST /api/cmdgo/login|cancel|logout`。
+### 4. 启动
 
-## 多账号池（0.2.0+）
+**Windows**:双击 `start.cmd`(保持窗口开启即在线,关闭即停止)。
 
-反代支持池化多个 Command Code 账号，摊薄单账号额度：
+**任意平台**(命令行):
 
-- **入池**：设置页每完成一次 OAuth 登录，新 key 自动成为池中一个独立账号（凭据存储按账号分 ref，清单在 `~/.dsh/cmdgo-accounts.json`）；重复登录同一 key 只刷新标签。升级无缝：既有单 key 自动收编为 `default` 账号。
-- **调度**：请求级 round-robin；某账号失败（401/403/429/5xx/传输错误）按指数冷却（30s 起，封顶 15min）并当次请求内自动切换下一账号（首字节前才允许换号，绝不重放半截回答）。网关接受即清除该账号失败计数。
-- **管理**：状态接口新增 `accounts` / `activeAccounts`；`POST /api/cmdgo/account/toggle|remove` 启停与移除单个账号，`/logout` 改为清空整个账号池。
+```sh
+npm start              # 或: node dist/index.js
+```
 
-## 协议实现
+首次启动自动生成配置,终端会打印类似:
 
-请求信封与流式解析对齐官方 CLI（`x-command-code-version`、NDJSON 事件流 text-delta / reasoning-delta / tool-call / finish-step）。请求指纹完整复刻官方 `cmd` CLI（v1.31.0 实测还原）：`User-Agent: commandcode/<version>` + `x-command-code-version` / `x-cli-environment: production` / `x-taste-learning` / `x-session-id` / `x-project-slug`，反代流量与 CLI 本体在网关上不可区分，参考了 [MAXeaglet/commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy)、[synthetic-coworkers/cmdcode2api](https://github.com/synthetic-coworkers/cmdcode2api) 与 [jiesou/dsh-commandcode-go-provider](https://github.com/jiesou/dsh-commandcode-go-provider)。
+```
+OpenAI 端点: http://127.0.0.1:11435/v1
+客户端 API key: 4e80cd8cbac4c07ab03db0afc95fdb5c1d0d9f9f22d073f7
+```
+
+### 5. 完成 OAuth 登录
+
+1. 浏览器打开 **http://127.0.0.1:11435/**
+2. 点「**▸ 发起登录**」→ 出现登录地址,点「**打开登录页 ↗**」
+3. 在 Command Code 授权页确认,浏览器会把 API key 回传给本机
+4. 控制台状态变为「**✓ 授权成功**」,账号出现在账号池(状态 `READY`)
+
+### 6. 在 Agent 工具中配置
+
+任意 OpenAI 兼容客户端,填三项:
+
+| 配置项 | 值 |
+| --- | --- |
+| Base URL | `http://127.0.0.1:11435/v1` |
+| API Key | 终端打印的 key(或控制台 CONFIG 区查看/复制) |
+| 模型 ID | 控制台 MODELS 区列出的模型,点击即复制(如 `deepseek/deepseek-v4-pro`) |
+
+验证连通:
+
+```sh
+curl http://127.0.0.1:11435/v1/chat/completions \
+  -H "Authorization: Bearer <你的API Key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"你好"}]}'
+```
+
+各家工具接入举例:
+
+- **ZCode / Cherry Studio / NextChat / LobeChat**:新增 OpenAI 兼容供应商,填上表三项即可
+- **Cline / Roo Code**:OpenAI Compatible 供应商,Base URL 填 `http://127.0.0.1:11435/v1`
+- **Cursor**:Settings → Models → OpenAI API Key 填 bridge key,并覆写 Base URL 为 `http://127.0.0.1:11435/v1`
+- **Continue**:config.json 里加 `{"provider":"openai","apiBase":"http://127.0.0.1:11435/v1",...}`
+
+## 多账号池
+
+每完成一次 OAuth 登录,新 key 自动成为池中一个独立账号(元数据落在数据目录 `accounts.json`,key 在 `credentials.json`);重复登录同一 key 只刷新标签。
+
+- 请求级 **round-robin** 调度;某账号失败按指数冷却(30s 起、封顶 15min),当次请求内自动切换下一账号
+- 控制台可**停用 / 启用 / 移除**单个账号,「清空账号池」清空全部
 
 ## 配置
 
+数据目录默认 `~/.cmdgo-bridge/`(可用 `--data-dir` 指定),`config.json` 首次启动自动生成:
+
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `apiKeyEnv` | `COMMANDCODE_API_KEY` | 凭据引用（登录成功后自动写入） |
-| `baseURL` | `https://api.commandcode.ai` | 网关 base URL |
+| `host` | `127.0.0.1` | 监听地址;`0.0.0.0` 局域网共享时 `/v1` 靠 API key 鉴权,控制台 `/api` 无鉴权请注意 |
+| `port` | `11435` | 监听端口 |
+| `baseURL` | `https://api.commandcode.ai` | 网关 base,`/alpha/generate` 自动追加 |
+| `apiKey` | 随机生成 | 客户端 Bearer token(改动手动写入需 ≥8 字符) |
 | `maxTokens` | `64000` | 单次输出上限 |
 | `defaultContextWindow` | `1000000` | 模型无精确上下文时的兜底 |
 
+命令行参数:`--host <addr>`、`--port <port>`、`--data-dir <dir>`、`--help`。
+
+## API 端点
+
+| 端点 | 鉴权 | 说明 |
+| --- | --- | --- |
+| `GET /v1/models` | Bearer | 模型列表 |
+| `POST /v1/chat/completions` | Bearer | 对话补全(流式 / 非流式) |
+| `GET /health` | 无 | 健康检查 |
+| `GET /` | 无 | 控制台页面 |
+| `GET /api/status` | 无(仅回环) | 登录 / 账号 / 模型状态快照 |
+| `POST /api/login` `cancel` `logout` | 无(仅回环) | 登录生命周期 |
+| `POST /api/account/toggle` `remove` | 无(仅回环) | 账号管理 |
+
+## 本地联调(无需真实订阅)
+
+`scripts/mock-gateway.mjs` 模拟官方网关,可完整走通流式、工具调用、多账号故障转移:
+
+```sh
+npm run mock                                   # 模拟网关 http://127.0.0.1:18999
+node dist/index.js --data-dir /tmp/bridge-test # 然后改该目录 config.json 的 baseURL 为 http://127.0.0.1:18999
+```
+
+mock 接受 `user_goodkey`(成功)/ `user_failkey`(403 测故障转移)/ `user_noplan`(`MODEL_NOT_IN_PLAN`),登录回调时填这些 key 即可。
+
 ## 排错
 
-- **装完不显示**：`dsh plugin add` 只写 profile 清单，运行中的 loader 需要重启（或热装配工具）才会加载；另外检查 `~/.dsh/profiles/web/cordis.patch.yml` 是否残留同 id 的 `disabled: true` 条目——卸载器会写它阻断自装配，重装前应删除。
-- **模型列表为空**：目录来自 `https://api.commandcode.ai/provider/v1/models`（免鉴权），检查宿主网络；首次扫描失败会在日志告警并每 15 分钟重试。
-- **对话报 MISSING_CREDENTIAL**：先到「设置 → CommandCode Go」完成登录，或手动向 `~/.dsh/.credentials.yaml` 写入 `COMMANDCODE_API_KEY: user_xxxx`。
-- **回调收不到**：回调服务器绑定在宿主 `127.0.0.1:5959..5968`；若浏览器与宿主不同机，需保证 `localhost:<port>` 能回到宿主（端口转发/SSH 隧道）。
+| 现象 | 原因与处理 |
+| --- | --- |
+| 启动报「端口已被占用」 | 已有实例在运行(可能上次的窗口没关),关掉旧窗口或用 `--port` 换端口 |
+| 对话报 `401 invalid_api_key` | Agent 工具里填的 key 与终端打印的不一致,去控制台 CONFIG 区复制 |
+| 对话报 `401 MISSING_CREDENTIAL` | 还没完成 OAuth 登录,先到控制台「发起登录」 |
+| 模型列表为空 | 目录来自 `https://api.commandcode.ai/provider/v1/models`(免鉴权),检查网络;日志会告警并 15 分钟后重试 |
+| 「重新连接 / 超时」 | 桥没在运行(关窗即停);或请求体超过 8MB 上限 | 
+| 控制台登录后收不到回调 | 回调服务器绑定 `127.0.0.1:5959..5968`;浏览器与宿主不同机时需端口转发/SSH 隧道 |
+| 想排查问题 | 每次请求都记录在启动窗口与 `~/.cmdgo-bridge/access.log`(方法/路径/状态码/耗时),聊天另有 model/账号/结果明细 |
 
-> 非官方插件，仅限个人使用；请遵守 Command Code 服务条款。
+## 工作原理
+
+请求指纹完整对齐官方 CLI(`commandcode/<版本>` UA + `x-command-code-version` / `x-cli-environment` / `x-session-id` / `x-project-slug`),请求信封与 NDJSON 事件流解析参考了 [commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy) 与 [cmdcode2api](https://github.com/synthetic-coworkers/cmdcode2api)。
+
+> ⚠️ 非官方项目,仅限个人使用;请遵守 Command Code 服务条款。

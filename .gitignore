@@ -1,5 +1,4 @@
 node_modules/
-*.tgz
+dist/
 *.log
-standalone/dist/
-standalone/.test-data/
+.test-data/

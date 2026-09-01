@@ -1,24 +1,24 @@
 /**
- * Multi-account credential pool for the Command Code Go reverse proxy.
+ * Multi-account credential pool for the Command Code Go bridge.
  *
  * Each OAuth login yields one API key; pooling several keys multiplies the
- * plan quota. Keys live in the standard credential store under per-account
- * refs (the primary ref stays reserved for the pre-pool single key), while a
- * small JSON manifest beside `.credentials.yaml` keeps pool metadata — ids,
+ * plan quota. Keys live in a small JSON credential store (`credentials.json`)
+ * under per-account refs, while `accounts.json` keeps pool metadata — ids,
  * labels, enabled flags, failure cooldowns — across restarts.
  *
  * Scheduling: round-robin over enabled accounts whose cooldown has expired;
  * a failed request puts its account on an exponential cool-down (capped) and
- * the adapter fails over to the next pick within the same request.
+ * the caller fails over to the next pick within the same request.
  *
- * @module cmdgo/pool
+ * @module cmdgo-bridge/pool
  */
 
-import { homedir } from 'node:os'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { randomBytes } from 'node:crypto'
-import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
+
+/** Credential store reference: a plain string naming an entry in the store. */
+export type CredentialRef = string
 
 /** One pooled account. The API key itself never appears here — only its ref. */
 export interface PoolAccount {
@@ -60,6 +60,14 @@ export interface CredentialsSeam {
   unset(ref: CredentialRef): Promise<void>
 }
 
+export interface PoolOptions {
+  /** Base credential ref; per-account refs derive from it. */
+  baseRef: string
+  /** Directory holding `accounts.json` (pool metadata). */
+  dataDir: string
+  log?: (message: string) => void
+}
+
 /**
  * The account pool. All mutations persist the manifest; all key material is
  * delegated to the credential store.
@@ -69,15 +77,18 @@ export class AccountPool {
   private loaded = false
   /** Round-robin cursor into the last usable ordering. */
   private cursor = 0
+  private readonly baseRef: string
+  private readonly dataDir: string
+  private readonly log: (message: string) => void
 
-  constructor(
-    /** Base/default credential ref (kept for the pre-pool single account). */
-    private readonly baseRef: CredentialRef,
-    private readonly log: (message: string) => void,
-  ) {}
+  constructor(options: PoolOptions) {
+    this.baseRef = options.baseRef
+    this.dataDir = options.dataDir
+    this.log = options.log ?? (() => {})
+  }
 
   private get file(): string {
-    return join(homedir(), '.dsh', 'cmdgo-accounts.json')
+    return join(this.dataDir, 'accounts.json')
   }
 
   private refFor(id: string): CredentialRef {
@@ -127,38 +138,6 @@ export class AccountPool {
     return this.accounts.filter(a => a.enabled && (a.cooldownUntil ?? 0) <= now).length
   }
 
-  /**
-   * Adopt the pre-pool single key as account #1 so upgrades are seamless.
-   * Only fires when the manifest has no entries and the base ref holds a key.
-   */
-  async adoptLegacy(credentials: CredentialsSeam | undefined): Promise<void> {
-    await this.ensureLoaded()
-    if (this.accounts.length > 0 || credentials === undefined) return
-    try {
-      const info = await credentials.describe(this.baseRef)
-      if (!info.configured) return
-      // 主 ref 的 key 若已与某个入池账号相同（老用户重新登录过），收编只会造成重复。
-      const legacyKey = await this.keyOf(credentials, { ref: this.baseRef } as PoolAccount)
-      if (legacyKey !== undefined) {
-        for (const account of this.accounts) {
-          const held = await this.keyOf(credentials, account)
-          if (held === legacyKey) return
-        }
-      }
-      this.accounts.push({
-        id: 'default',
-        ref: this.baseRef,
-        addedAt: Date.now(),
-        enabled: true,
-        failCount: 0,
-      })
-      await this.persist()
-      this.log('[cmdgo] 已将既有凭据收编为账号池 #1（default）')
-    } catch (_credentialsUnavailable) {
-      /* 服务未就绪：下次登录时再收编 */
-    }
-  }
-
   /** Whether any stored account already holds exactly this key. */
   async findByKey(credentials: CredentialsSeam, apiKey: string): Promise<PoolAccount | undefined> {
     await this.ensureLoaded()
@@ -176,7 +155,7 @@ export class AccountPool {
     await this.ensureLoaded()
     let id = slug(info.userName ?? info.keyName, 'acct')
     const taken = new Set(this.accounts.map(a => a.id))
-    if (taken.has(id) || id === 'default') id = `${id}-${randomBytes(2).toString('hex')}`
+    if (taken.has(id)) id = `${id}-${randomBytes(2).toString('hex')}`
     while (taken.has(id)) id = `${id}${randomBytes(1).toString('hex')}`
     const account: PoolAccount = {
       id,
@@ -206,6 +185,7 @@ export class AccountPool {
     const usable = this.accounts.filter(a => a.enabled && (a.cooldownUntil ?? 0) <= now)
     if (usable.length > 0) {
       const picked = usable[this.cursor % usable.length]
+      if (picked === undefined) return undefined
       this.cursor = (this.cursor + 1) % usable.length
       picked.lastUsedAt = now
       return picked
@@ -254,12 +234,13 @@ export class AccountPool {
     return true
   }
 
-  /** Remove one account and delete its stored key (env-sourced keys are unaffected by unset). */
+  /** Remove one account and delete its stored key. */
   async remove(credentials: CredentialsSeam | undefined, id: string): Promise<boolean> {
     await this.ensureLoaded()
     const index = this.accounts.findIndex(a => a.id === id)
     if (index < 0) return false
     const [gone] = this.accounts.splice(index, 1)
+    if (gone === undefined) return false
     if (credentials !== undefined) {
       try { await credentials.unset(gone.ref) } catch (_unsetFailure) { /* 键可能已被外部删除 */ }
     }
@@ -268,7 +249,7 @@ export class AccountPool {
     return true
   }
 
-  /** Remove every pooled account (full wipe); the base ref key is preserved. */
+  /** Remove every pooled account (full wipe). */
   async clear(credentials: CredentialsSeam | undefined): Promise<number> {
     await this.ensureLoaded()
     const count = this.accounts.length

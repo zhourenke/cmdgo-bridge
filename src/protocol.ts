@@ -1,42 +1,34 @@
 /**
- * Command Code Go wire protocol: translate between the harness LLM vocabulary
- * and Command Code's private `/alpha/generate` gateway.
+ * Command Code Go wire protocol: serialize a completion call into the private
+ * `/alpha/generate` gateway envelope and parse its line-delimited JSON stream
+ * back into events.
  *
  * The Go plan is the only Command Code plan without Provider-API access, so
  * the standard OpenAI-compatible endpoints answer 403 `upgrade_required` for
  * a Go subscription. The CLI gateway at `POST /alpha/generate` is the
- * transport every Go-plan request must use. This module serializes the
- * gateway request body and parses its line-delimited JSON stream back into
- * harness `StreamChunk`s.
+ * transport every Go-plan request must use.
  *
  * The request envelope shape mirrors the `cmd` CLI (`command-code` npm
- * package) and the opencode commandcode-go provider plugin:
- * - `config.environment` is a plain string (`<os>-<arch>`), not an object.
- * - Gateway compatibility rides on the `x-command-code-version` header.
+ * package): `config.environment` is a plain string (`<os>-<arch>`), not an
+ * object; gateway compatibility rides on the `x-command-code-version` header.
  *
- * @module commandcode-go/protocol
+ * @module cmdgo-bridge/protocol
+ * @see https://github.com/MAXeaglet/commandcode-proxy
+ * @see https://github.com/synthetic-coworkers/cmdcode2api
  */
 
-import { CallId } from '@deepseek-ai/dsh-llm'
-import type {
-  ContentBlock,
-  FinishReason,
-  GenerateOptions,
-  Message,
-  StreamChunk,
-  ToolSchema,
-} from '@deepseek-ai/dsh-llm'
 import { platform, arch } from 'node:os'
+import type { ContentBlock, GenerateOptions, Message, ToolSchema } from './types.js'
 
 /**
  * Gateway version pinned to a known-good Command Code CLI release. The gateway
  * checks the `x-command-code-version` header against the `User-Agent` version,
- * so both must track the same CLI release (here: the CLI installed in this
- * environment, v1.31.0 — request/response envelope verified unchanged).
+ * so both must track the same CLI release (v1.31.0 — envelope verified
+ * unchanged against the CLI in use when the reference plugin was written).
  */
 export const CC_VERSION = '1.31.0'
 
-/** Last-resort output cap when a request carries no maxTokens (matches the adapter default). */
+/** Last-resort output cap when a request carries no maxTokens. */
 export const DEFAULT_MAX_TOKENS = 64_000
 
 /** Line-delimited JSON stream: one JSON object per line (not SSE `data:` framing). */
@@ -182,7 +174,7 @@ function serializeUser(message: Message): CcMessage {
   }
 }
 
-/** Build the gateway request envelope for one harness call. */
+/** Build the gateway request envelope for one completion call. */
 export function buildRequest(options: GenerateOptions): CcRequestEnvelope {
   let system = options.system ?? ''
   const messages: CcMessage[] = []
@@ -211,6 +203,7 @@ export function buildRequest(options: GenerateOptions): CcRequestEnvelope {
     stream: true,
   }
   if (options.temperature !== undefined) params.temperature = options.temperature
+  if (options.topP !== undefined) params.top_p = options.topP
   if (options.reasoningEffort !== undefined && options.reasoningEffort !== 'off') {
     params.reasoning_effort = options.reasoningEffort
   }
@@ -218,7 +211,7 @@ export function buildRequest(options: GenerateOptions): CcRequestEnvelope {
   return {
     config: {
       workingDir: process.cwd(),
-      date: new Date().toISOString().split('T')[0],
+      date: new Date().toISOString().split('T')[0] ?? '',
       environment: `${platform()}-${arch()}`,
       structure: [],
       isGitRepo: false,
@@ -232,104 +225,6 @@ export function buildRequest(options: GenerateOptions): CcRequestEnvelope {
     skills: null,
     permissionMode: 'standard',
     params,
-  }
-}
-
-/**
- * Translate one gateway stream event into one or more harness StreamChunks.
- * @returns an empty array when the event has no harness representation.
- */
-export function eventToChunks(
-  event: CcStreamEvent,
-  state: { blockIndex: number },
-): StreamChunk[] {
-  const chunks: StreamChunk[] = []
-  switch (event.type) {
-    case 'text-start': {
-      chunks.push({ type: 'block-start', index: state.blockIndex, blockType: 'text' })
-      break
-    }
-    case 'text-delta': {
-      const text = typeof event.text === 'string' ? event.text : ''
-      if (text.length > 0) {
-        chunks.push({ type: 'text-delta', index: state.blockIndex, text })
-      }
-      break
-    }
-    case 'reasoning-start': {
-      chunks.push({ type: 'block-start', index: state.blockIndex, blockType: 'reasoning' })
-      break
-    }
-    case 'reasoning-delta': {
-      const text = typeof event.text === 'string' ? event.text : ''
-      if (text.length > 0) {
-        chunks.push({ type: 'reasoning-delta', index: state.blockIndex, text })
-      }
-      break
-    }
-    case 'tool-call': {
-      const input = event.input ?? event.args ?? event.arguments
-      const callId = typeof event.toolCallId === 'string' ? event.toolCallId
-        : typeof event.id === 'string' ? event.id
-          : ''
-      chunks.push({
-        type: 'tool-call-delta',
-        index: state.blockIndex,
-        id: CallId(callId),
-        ...typeof event.toolName === 'string' ? { name: event.toolName } : {},
-        argumentsDelta: JSON.stringify(input ?? {}),
-      })
-      break
-    }
-    case 'finish-step': {
-      const usage = isRecord(event.usage) ? event.usage as unknown as CcUsage : undefined
-      if (usage) {
-        const inputDetails = isRecord(usage.inputTokenDetails) ? usage.inputTokenDetails : undefined
-        const outputDetails = isRecord(usage.outputTokenDetails) ? usage.outputTokenDetails : undefined
-        const cacheRead = inputDetails?.cacheReadTokens
-        const totalInput = usage.inputTokens
-        const noCache = inputDetails?.noCacheTokens
-        const inputTokens = noCache ?? (totalInput !== undefined && cacheRead !== undefined
-          ? Math.max(0, totalInput - cacheRead)
-          : totalInput) ?? 0
-        const outputTokens = usage.outputTokens ?? outputDetails?.textTokens ?? 0
-        chunks.push({
-          type: 'usage',
-          usage: {
-            inputTokens,
-            outputTokens,
-            ...cacheRead !== undefined ? { cacheReadTokens: cacheRead } : {},
-            ...outputDetails?.reasoningTokens !== undefined ? { reasoningTokens: outputDetails.reasoningTokens } : {},
-          },
-        })
-      }
-      const reason = event.finishReason ?? event.rawFinishReason ?? 'stop'
-      chunks.push({ type: 'finish', reason: mapFinishReason(reason) })
-      break
-    }
-  }
-  return chunks
-}
-
-/** Map the gateway finish-reason vocabulary to the harness FinishReason. */
-function mapFinishReason(raw: unknown): FinishReason {
-  const reason = typeof raw === 'string' ? raw : 'stop'
-  switch (reason) {
-    case 'stop':
-    case 'end_turn':
-      return { kind: 'stop' }
-    case 'tool_calls':
-    case 'tool-calls':
-      return { kind: 'tool-calls' }
-    case 'length':
-    case 'max_tokens':
-    case 'max-output-tokens':
-      return { kind: 'max-tokens' }
-    default:
-      return {
-        kind: 'error',
-        failure: { message: `model stopped: ${reason}`, code: reason.toUpperCase() },
-      }
   }
 }
 

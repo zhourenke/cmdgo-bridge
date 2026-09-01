@@ -1,74 +1,42 @@
 {
-  "name": "dsh-cmdgo-provider",
-  "version": "0.3.0",
-  "description": "CommandCode Go 套餐供应商：/alpha/generate CLI 网关（官方 CLI 指纹伪装）接入 DSH 模型列表 + OAuth 登录（多账号池轮询/故障转移）",
+  "name": "cmdgo-bridge",
+  "version": "0.1.0",
+  "description": "CommandCode Go 套餐独立桥接服务：/alpha/generate CLI 网关 → OpenAI 兼容 API，含 OAuth 登录与多账号池，附自带控制台页面",
   "type": "module",
-  "main": "./lib/index.js",
-  "exports": {
-    ".": {
-      "default": "./lib/index.js"
-    },
-    "./client": {
-      "default": "./lib/client.js"
-    },
-    "./package.json": "./package.json",
-    "./cordis.patch.yml": "./cordis.patch.yml"
+  "main": "dist/index.js",
+  "bin": {
+    "cmdgo-bridge": "dist/index.js"
   },
   "files": [
-    "lib",
-    "cordis.patch.yml",
-    "README.md",
-    "LICENSE"
+    "dist",
+    "public",
+    "README.md"
   ],
   "scripts": {
-    "build": "bash scripts/build.sh",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js",
+    "mock": "node scripts/mock-gateway.mjs"
+  },
+  "engines": {
+    "node": ">=20.3.0"
   },
   "keywords": [
-    "dsh",
-    "dsh-plugin",
-    "deepseek-harness",
     "commandcode",
     "commandcode-go",
     "cmdgo",
+    "openai-compatible",
     "llm-provider",
-    "oauth"
+    "bridge",
+    "proxy"
   ],
   "license": "MIT",
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    },
-    "client": {
-      "inject": [
-        "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-ui-slots"
-      ],
-      "platform": "web"
-    }
-  },
-  "peerDependencies": {
-    "@deepseek-ai/cordis": ">=4.0.1 <5",
-    "@deepseek-ai/dsh-credentials": ">=0.1.0-rc.6 <0.2.0",
-    "@deepseek-ai/dsh-launch-environment": ">=0.1.0-rc.6 <0.2.0",
-    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6 <0.2.0",
-    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.6 <0.2.0",
-    "@deepseek-ai/dsh-timeout": ">=0.1.0-rc.6 <0.2.0",
-    "@deepseek-ai/schemastery": "^3.18.1"
-  },
-  "devDependencies": {
-    "@types/node": "^22.20.1",
-    "typescript": "^5.9.0"
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Patrick-mufeng/cmdgo-bridge.git"
   },
-  "bugs": {
-    "url": "https://github.com/Patrick-mufeng/cmdgo-bridge/issues"
-  },
-  "homepage": "https://github.com/Patrick-mufeng/cmdgo-bridge#readme",
-  "publishConfig": {
-    "access": "public"
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.0"
   }
 }

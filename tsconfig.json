@@ -1,20 +1,18 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+    "lib": ["ES2022"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["node"],
-    "strict": true,
-    "skipLibCheck": true,
-    "declaration": false,
-    "outDir": "lib",
+    "outDir": "dist",
     "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "esModuleInterop": true,
     "skipLibCheck": true,
-    "baseUrl": ".",
-    "paths": {
-      "@deepseek-ai/*": ["node_modules/@deepseek-ai/*"]
-    }
+    "forceConsistentCasingInFileNames": true,
+    "sourceMap": false,
+    "declaration": false
   },
   "include": ["src"]
 }
