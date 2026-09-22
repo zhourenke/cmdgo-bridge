@@ -266,6 +266,16 @@ export async function* parseEventStream(stream: ReadableStream<Uint8Array>): Asy
       }
     }
   } finally {
+    // Cancel before releasing the lock. Callers stop reading as soon as they
+    // see `finish-step` and return the generator, which does NOT close the
+    // underlying stream: `releaseLock()` alone leaves the upstream response
+    // body unconsumed, stranding the HTTP connection for every streamed
+    // request. Cancelling aborts the body so the socket can be reused.
+    try {
+      await reader.cancel()
+    } catch {
+      // Already errored or closed; nothing left to release.
+    }
     reader.releaseLock()
   }
 }

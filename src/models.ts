@@ -26,13 +26,15 @@
 export interface GoModel {
   id: string
   name: string
-  contextWindow: number
+  /**
+   * Context capacity the listing disclosed, or `undefined` when it disclosed
+   * none. This module deliberately invents no number: the caller substitutes
+   * its configured fallback, so the two can never disagree.
+   */
+  contextWindow?: number
   /** Reasoning-effort ids the gateway accepts for this model, in display order. */
   efforts?: string[]
 }
-
-/** Context capacity assumed when the listing discloses none. */
-const FALLBACK_CONTEXT_WINDOW = 262_144
 
 /** Premium models included on the Go plan outright (from docs/plans/go). */
 const GO_PREMIUM_EXCEPTIONS: ReadonlySet<string> = new Set([
@@ -122,6 +124,9 @@ const DEFAULT_MODELS_URL = 'https://api.commandcode.ai/provider/v1/models'
 const CATALOG_URL = 'https://cdn.jsdelivr.net/npm/command-code@latest/dist/bundled/command-code-knowledge/reference/models.md'
 /** Single-request fetch budget for the catalog (the API listing is separate). */
 const CATALOG_TIMEOUT_MS = 30_000
+/** Single-request fetch budget for the model listing; without it a stalled
+ * endpoint leaves the periodic catalog sync pending forever. */
+const MODELS_TIMEOUT_MS = 30_000
 
 /** Fetch the official CLI catalog and extract per-model reasoning efforts. */
 export async function fetchCatalogEfforts(
@@ -145,6 +150,7 @@ export async function fetchGoModels(
 ): Promise<GoModel[]> {
   const response = await fetchImpl(url, {
     headers: { accept: 'application/json' },
+    signal: AbortSignal.timeout(MODELS_TIMEOUT_MS),
   })
   if (!response.ok) {
     throw new Error(`Command Code models endpoint answered HTTP ${response.status}`)
@@ -159,10 +165,8 @@ export async function fetchGoModels(
     const id = nonEmptyString(raw.id)
     if (id === undefined || !isGoModel(id)) continue
     const name = nonEmptyString(raw.name) ?? id.split('/').pop() ?? id
-    const contextWindow = positiveNumber(raw.context_length)
-      ?? positiveNumber(raw.context_window)
-      ?? FALLBACK_CONTEXT_WINDOW
-    models.push({ id, name, contextWindow })
+    const contextWindow = positiveNumber(raw.context_length) ?? positiveNumber(raw.context_window)
+    models.push({ id, name, ...(contextWindow === undefined ? {} : { contextWindow }) })
   }
   // Stable order keeps the diff against a persisted catalog deterministic.
   models.sort((a, b) => a.id.localeCompare(b.id))

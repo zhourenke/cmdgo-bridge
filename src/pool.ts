@@ -74,7 +74,10 @@ export interface PoolOptions {
  */
 export class AccountPool {
   private accounts: PoolAccount[] = []
-  private loaded = false
+  /** In-flight or completed first load, shared by concurrent callers. */
+  private loadPromise: Promise<void> | undefined
+  /** Serializes manifest writes; see `persist`. */
+  private persistQueue: Promise<void> = Promise.resolve()
   /** Round-robin cursor into the last usable ordering. */
   private cursor = 0
   private readonly baseRef: string
@@ -95,10 +98,19 @@ export class AccountPool {
     return `${this.baseRef}_${id.toUpperCase().replace(/[^A-Z0-9]/g, '')}` as CredentialRef
   }
 
-  /** Load the manifest once; corrupt files start over (keys stay in the store). */
-  private async ensureLoaded(): Promise<void> {
-    if (this.loaded) return
-    this.loaded = true
+  /**
+   * Load the manifest once (idempotent, shared across concurrent callers).
+   * Public so a caller that picks synchronously can await readiness first.
+   */
+  ensureLoaded(): Promise<void> {
+    // Share one in-flight load. Setting the flag before the await let a second
+    // caller through while `accounts` was still empty: `add()` would then
+    // persist a manifest containing only its own account, wiping the rest.
+    this.loadPromise ??= this.load()
+    return this.loadPromise
+  }
+
+  private async load(): Promise<void> {
     try {
       const raw = await readFile(this.file, 'utf8')
       const parsed = JSON.parse(raw) as Partial<Manifest>
@@ -111,17 +123,28 @@ export class AccountPool {
     }
   }
 
-  private async persist(): Promise<void> {
+  /**
+   * Persist the manifest. The payload is snapshotted at call time and the
+   * writes are serialized: `toggle` and `reportFailure` persist fire-and-forget,
+   * and unserialized renames can complete out of order, letting a stale
+   * snapshot overwrite a newer one.
+   */
+  private persist(): Promise<void> {
     const path = this.file
     const payload = JSON.stringify({ version: 1, accounts: this.accounts } satisfies Manifest, null, 2)
-    try {
-      await mkdir(dirname(path), { recursive: true })
-      const tmp = `${path}.${randomBytes(4).toString('hex')}.tmp`
-      await writeFile(tmp, payload, 'utf8')
-      await rename(tmp, path)
-    } catch (error) {
-      this.log(`[cmdgo] 账号清单写入失败（不影响本次会话）：${error instanceof Error ? error.message : String(error)}`)
+    const run = async (): Promise<void> => {
+      try {
+        await mkdir(dirname(path), { recursive: true })
+        const tmp = `${path}.${randomBytes(4).toString('hex')}.tmp`
+        await writeFile(tmp, payload, 'utf8')
+        await rename(tmp, path)
+      } catch (error) {
+        this.log(`[cmdgo] 账号清单写入失败（不影响本次会话）：${error instanceof Error ? error.message : String(error)}`)
+      }
     }
+    const result = this.persistQueue.then(run, run)
+    this.persistQueue = result
+    return result
   }
 
   async list(): Promise<PoolAccount[]> {
@@ -154,9 +177,15 @@ export class AccountPool {
   async add(credentials: CredentialsSeam, info: { apiKey: string; userName?: string; keyName?: string }): Promise<PoolAccount> {
     await this.ensureLoaded()
     let id = slug(info.userName ?? info.keyName, 'acct')
-    const taken = new Set(this.accounts.map(a => a.id))
-    if (taken.has(id)) id = `${id}-${randomBytes(2).toString('hex')}`
-    while (taken.has(id)) id = `${id}${randomBytes(1).toString('hex')}`
+    // Uniqueness must hold for the derived credential ref, not just the id:
+    // `refFor` strips non-alphanumerics, so ids `a-b` and `ab` both map to
+    // `…_AB` and the second key would silently overwrite the first account's.
+    const takenIds = new Set(this.accounts.map(a => a.id))
+    const takenRefs = new Set(this.accounts.map(a => a.ref))
+    const collides = (candidate: string): boolean =>
+      takenIds.has(candidate) || takenRefs.has(this.refFor(candidate))
+    if (collides(id)) id = `${id}-${randomBytes(2).toString('hex')}`
+    while (collides(id)) id = `${id}${randomBytes(1).toString('hex')}`
     const account: PoolAccount = {
       id,
       ref: this.refFor(id),

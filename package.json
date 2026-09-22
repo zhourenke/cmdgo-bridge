@@ -15,6 +15,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test",
     "start": "node dist/index.js",
     "mock": "node scripts/mock-gateway.mjs"
   },

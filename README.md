@@ -102,12 +102,13 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `host` | `127.0.0.1` | 监听地址;`0.0.0.0` 局域网共享时 `/v1` 靠 API key 鉴权,控制台 `/api` 无鉴权请注意 |
+| `host` | `127.0.0.1` | 监听地址;`0.0.0.0` 局域网共享时 `/v1` 靠 API key 鉴权,控制台与管理面仅接受同源请求 |
 | `port` | `11435` | 监听端口 |
 | `baseURL` | `https://api.commandcode.ai` | 网关 base,`/alpha/generate` 自动追加 |
 | `apiKey` | 随机生成 | 客户端 Bearer token(改动手动写入需 ≥8 字符) |
 | `maxTokens` | `64000` | 单次输出上限 |
-| `defaultContextWindow` | `1000000` | 模型无精确上下文时的兜底 |
+| `defaultContextWindow` | `262144` | 上游清单未披露容量时的兜底;正常情况用清单里的真实值,经 `/v1/models` 的 `context_length` 下发给客户端 |
+| `allowedHosts` | `[]` | 允许访问控制台 / 管理面的额外域名(经反向代理或局域网域名访问时填写);回环名、IP 字面量与 `host` 本身始终允许 |
 
 命令行参数:`--host <addr>`、`--port <port>`、`--data-dir <dir>`、`--help`。注意:`--host` / `--port` 会**写回 `config.json` 持久化**,下次启动继续生效。
 
@@ -115,13 +116,15 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 
 | 端点 | 鉴权 | 说明 |
 | --- | --- | --- |
-| `GET /v1/models` | Bearer | 模型列表 |
+| `GET /v1/models` | Bearer | 模型列表(含 `context_length` 上下文容量) |
 | `POST /v1/chat/completions` | Bearer | 对话补全(流式 / 非流式) |
 | `GET /health` | 无 | 健康检查 |
 | `GET /` | 无 | 控制台页面 |
-| `GET /api/status` | 无(仅回环) | 登录 / 账号 / 模型状态快照 |
-| `POST /api/login` `cancel` `logout` | 无(仅回环) | 登录生命周期 |
-| `POST /api/account/toggle` `remove` | 无(仅回环) | 账号管理 |
+| `GET /api/status` | 无鉴权,仅同源 | 登录 / 账号 / 模型状态快照 |
+| `POST /api/login` `cancel` `logout` | 无鉴权,仅同源 | 登录生命周期 |
+| `POST /api/account/toggle` `remove` | 无鉴权,仅同源 | 账号管理 |
+
+> 管理面(`/api/*`、`/health`、控制台页面)不携带 token,因此额外校验 `Origin` 同源与 `Host` 白名单:其它站点发起的跨源请求、以及把域名解析到回环地址的 DNS rebinding 都会被 403 拒绝。`/v1/*` 保持宽松 CORS,由 Bearer token 保护。
 
 ## 本地联调(无需真实订阅)
 
@@ -142,7 +145,8 @@ mock 接受 `user_goodkey`(成功)/ `user_failkey`(403 测故障转移)/ `user_n
 | 对话报 `401 invalid_api_key` | Agent 工具里填的 key 与终端打印的不一致,去控制台 CONFIG 区复制 |
 | 对话报 `401 MISSING_CREDENTIAL` | 还没完成 OAuth 登录,先到控制台「发起登录」 |
 | 模型列表为空 | 目录来自 `https://api.commandcode.ai/provider/v1/models`(免鉴权),检查网络;日志会告警并 15 分钟后重试 |
-| 「重新连接 / 超时」 | 桥没在运行(关窗即停);或请求体超过 8MB 上限 | 
+| 「重新连接 / 超时」 | 桥没在运行(关窗即停);或请求体超过 8MB 上限 |
+| 控制台打不开或全是 403 | 用域名(反向代理 / hosts 别名)访问管理面时,把该域名加进 `config.json` 的 `allowedHosts` 再重启;日志会打印被拒的 `host` | 
 | 连不上 11435(端口变了) | 检查 `~/.cmdgo-bridge/config.json` 的 `port`(`--port` 启动会写回并持久化) | 
 | 控制台登录后收不到回调 | 回调服务器绑定 `127.0.0.1:5959..5968`;浏览器与宿主不同机时需端口转发/SSH 隧道 |
 | 想排查问题 | 每次请求都记录在启动窗口与 `~/.cmdgo-bridge/access.log`(方法/路径/状态码/耗时),聊天另有 model/账号/结果明细 |

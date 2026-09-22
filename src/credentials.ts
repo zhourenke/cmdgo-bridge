@@ -15,6 +15,8 @@ type StoreShape = Record<string, { value: string; source?: string }>
 export class FileCredentials implements CredentialsSeam {
   private readonly file: string
   private cache: StoreShape | undefined
+  /** Serializes mutations so concurrent set/unset cannot interleave. */
+  private queue: Promise<void> = Promise.resolve()
 
   constructor(dataDir: string) {
     this.file = join(dataDir, 'credentials.json')
@@ -34,12 +36,30 @@ export class FileCredentials implements CredentialsSeam {
     return this.cache
   }
 
-  private async write(): Promise<void> {
-    const store = await this.read()
+  private async write(store: StoreShape): Promise<void> {
     await mkdir(dirname(this.file), { recursive: true })
     const tmp = `${this.file}.${randomBytes(4).toString('hex')}.tmp`
     await writeFile(tmp, JSON.stringify(store, null, 2), 'utf8')
     await rename(tmp, this.file)
+  }
+
+  /**
+   * Apply one mutation, committing it to the in-memory cache only after the
+   * write lands. Mutating the cache first left memory and disk disagreeing
+   * whenever the write failed (read-only directory, full disk), so later reads
+   * reported a credential that had never been persisted.
+   */
+  private mutate(apply: (store: StoreShape) => StoreShape | undefined): Promise<void> {
+    const run = async (): Promise<void> => {
+      const current = await this.read()
+      const next = apply({ ...current })
+      if (next === undefined) return
+      await this.write(next)
+      this.cache = next
+    }
+    const result = this.queue.then(run, run)
+    this.queue = result.catch(() => {})
+    return result
   }
 
   async resolve(ref: CredentialRef): Promise<{ value: string } | undefined> {
@@ -59,15 +79,17 @@ export class FileCredentials implements CredentialsSeam {
   }
 
   async set(ref: CredentialRef, value: string): Promise<void> {
-    const store = await this.read()
-    store[ref] = { value, ...(store[ref]?.source === undefined ? {} : { source: store[ref].source }) }
-    await this.write()
+    await this.mutate((store) => {
+      store[ref] = { value, ...(store[ref]?.source === undefined ? {} : { source: store[ref].source }) }
+      return store
+    })
   }
 
   async unset(ref: CredentialRef): Promise<void> {
-    const store = await this.read()
-    if (store[ref] === undefined) return
-    delete store[ref]
-    await this.write()
+    await this.mutate((store) => {
+      if (store[ref] === undefined) return undefined
+      delete store[ref]
+      return store
+    })
   }
 }

@@ -9,10 +9,10 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { appendFile } from 'node:fs/promises'
 import { readFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { timingSafeEqual } from 'node:crypto'
+import { DEFAULT_DATA_DIR } from './config.js'
 import type { ServerConfig } from './config.js'
 import { AccountPool } from './pool.js'
 import type { CredentialsSeam, PoolAccount } from './pool.js'
@@ -29,6 +29,7 @@ import {
   emptyAccumulator,
   openGateway,
   parseChatRequest,
+  usageObject,
 } from './openai.js'
 import type { ChatRequest, Accumulator } from './openai.js'
 
@@ -46,6 +47,8 @@ export interface BridgeModel {
 
 export interface BridgeState {
   cfg: ServerConfig
+  /** Data directory; also where the access log is written. */
+  dataDir: string
   credentials: CredentialsSeam
   pool: AccountPool
   login: CommandCodeLoginManager
@@ -56,12 +59,16 @@ export interface BridgeState {
 }
 
 const INDEX_FILE = join(fileURLToPath(new URL('.', import.meta.url)), '..', 'public', 'index.html')
-/** 访问/聊天日志落盘：无论桥由谁启动(控制台 vs 双击脚本)都可追溯。 */
-const ACCESS_LOG_FILE = join(homedir(), '.cmdgo-bridge', 'access.log')
+/**
+ * 访问/聊天日志落盘：无论桥由谁启动(控制台 vs 双击脚本)都可追溯。
+ * Follows the configured data directory so a `--data-dir` run does not scatter
+ * its logs into `~/.cmdgo-bridge`; `createBridgeServer` overrides this.
+ */
+let accessLogFile = join(DEFAULT_DATA_DIR, 'access.log')
 
 function logLine(line: string): void {
   console.log(line)
-  void appendFile(ACCESS_LOG_FILE, `${line}\n`).catch(() => {})
+  void appendFile(accessLogFile, `${line}\n`).catch(() => {})
 }
 
 function json(res: ServerResponse, statusCode: number, body: unknown): void {
@@ -71,13 +78,68 @@ function json(res: ServerResponse, statusCode: number, body: unknown): void {
   res.end(JSON.stringify(body))
 }
 
+/**
+ * CORS for the OpenAI-compatible surface only. That surface is protected by the
+ * bearer token, and browser-based clients legitimately live on other origins.
+ */
 function cors(res: ServerResponse): void {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
 }
 
+/** IPv4 literal, e.g. 192.168.1.10. */
+const IPV4_LITERAL = /^\d{1,3}(?:\.\d{1,3}){3}$/
+
+/**
+ * Whether the `Host` header names something the admin surface may answer to.
+ *
+ * Without this, a DNS-rebinding page (`evil.com` resolving to 127.0.0.1) is
+ * same-origin with the bridge and sails past the `Origin` check below. Only
+ * loopback names, IP literals, the configured bind host and anything listed in
+ * `allowedHosts` are accepted, so a rebound request carrying `Host: evil.com`
+ * is refused. Operators behind a reverse proxy or a LAN name add it to
+ * `allowedHosts` in config.json.
+ */
+function hostAllowed(req: IncomingMessage, cfg: ServerConfig): boolean {
+  const host = req.headers.host
+  if (typeof host !== 'string' || host.length === 0) return false
+  const name = host.replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase()
+  if (name === 'localhost' || name === '::1') return true
+  if (IPV4_LITERAL.test(name)) return true
+  // Bracketed IPv6 keeps its colons after the port strip.
+  if (name.includes(':')) return true
+  if (name === cfg.host.toLowerCase()) return true
+  return cfg.allowedHosts.includes(name)
+}
+
+/**
+ * Whether a browser request may touch the admin surface.
+ *
+ * `/api/*` and `/health` carry no token, so without this check any web page the
+ * user visits could read `/api/status` — which discloses the bearer token — or
+ * POST `/api/logout` and wipe the account pool. Cross-origin requests are
+ * refused; the same-origin console and non-browser clients such as curl (which
+ * send no `Origin`) are unaffected.
+ */
+function originAllowed(req: IncomingMessage): boolean {
+  const origin = req.headers.origin
+  if (typeof origin !== 'string' || origin.length === 0) return true
+  const host = req.headers.host
+  if (typeof host !== 'string' || host.length === 0) return false
+  try {
+    return new URL(origin).host === host
+  } catch {
+    return false
+  }
+}
+
 async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  // Reject an oversized body from its declared length before buffering anything.
+  const declared = Number(req.headers['content-length'])
+  if (Number.isSafeInteger(declared) && declared > BODY_CAP) {
+    throw new ClientError('request body too large (max 8 MiB)', 413)
+  }
   const chunks: Buffer[] = []
   let size = 0
   let overflow = false
@@ -106,9 +168,10 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> 
 
 export function createBridgeServer(state: BridgeState): Server {
   const { cfg, credentials, pool, login } = state
+  accessLogFile = join(state.dataDir, 'access.log')
 
-  // 池预热：账号池是懒加载的，不预读的话启动后的第一个请求会误报
-  // MISSING_CREDENTIAL（池 size=0，pick 不到账号）。立即加载一次。
+  // 池预热：`openGateway` 会自行等待加载完成，这里只是免去首个请求的加载
+  // 延迟，并让坏清单在启动日志里尽早暴露。
   void pool.list().catch(() => {})
 
   /** 模型目录实时视图；sync() 换入新目录后接口立刻可见。 */
@@ -223,6 +286,12 @@ export function createBridgeServer(state: BridgeState): Server {
         object: 'model',
         created: 0,
         owned_by: 'commandcode',
+        // Not part of the OpenAI schema, but the field clients actually read
+        // for this (it is also what Command Code's own listing discloses, and
+        // the first name DSH's discovery tries). A client without it can only
+        // guess the capacity, and so cannot tell a reply the provider truncated
+        // from one the model chose to end.
+        context_length: m.contextWindow,
       })),
     })
   }
@@ -295,7 +364,6 @@ export function createBridgeServer(state: BridgeState): Server {
     res.setHeader('Cache-Control', 'no-cache')
     res.setHeader('Connection', 'keep-alive')
     res.setHeader('X-Accel-Buffering', 'no')
-    cors(res)
     // 立即送出响应头：setHeader 只是登记，flushHeaders 才真正发出去；
     // 否则首 token 之前的等待期里客户端收不到任何字节。
     res.flushHeaders()
@@ -370,13 +438,7 @@ export function createBridgeServer(state: BridgeState): Server {
     }
     if (!res.writableEnded) {
       emit(choice({}, acc.finishReason ?? 'stop'))
-      emit({ ...meta, choices: [], usage: {
-        prompt_tokens: acc.promptTokens,
-        completion_tokens: acc.completionTokens,
-        total_tokens: acc.promptTokens + acc.completionTokens,
-        prompt_tokens_details: { cached_tokens: acc.cacheReadTokens },
-        completion_tokens_details: { reasoning_tokens: acc.reasoningTokens },
-      } })
+      emit({ ...meta, choices: [], usage: usageObject(acc) })
       res.end('data: [DONE]\n\n')
     }
   }
@@ -384,6 +446,9 @@ export function createBridgeServer(state: BridgeState): Server {
   /* ---------------- /api/* : 控制台管理面 ---------------- */
 
   async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> {
+    // The pool loads lazily and `toggle` reads it synchronously; awaiting here
+    // keeps every admin action from racing the first load.
+    await pool.ensureLoaded()
     const action = pathname.slice('/api'.length) || '/'
     if (req.method === 'GET' && (action === '/status' || action === '/')) {
       json(res, 200, await statusSnapshot())
@@ -433,14 +498,12 @@ export function createBridgeServer(state: BridgeState): Server {
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     res.on('error', () => {})
-    cors(res)
-    if (req.method === 'OPTIONS') {
-      res.statusCode = 204
-      res.end()
-      return
-    }
     const url = new URL(req.url ?? '/', 'http://localhost')
     const pathname = url.pathname
+    // `/v1/*` authenticates with the bearer token; every other path is the
+    // unauthenticated console/admin surface, which must not be reachable
+    // cross-origin or through a hostname rebound to loopback.
+    const tokenProtected = pathname.startsWith('/v1/')
     // 访问日志：任何到达桥的请求都会留痕（含客户端断连）。
     const accessStartedAt = Date.now()
     const logAccess = (note = ''): void => {
@@ -450,6 +513,23 @@ export function createBridgeServer(state: BridgeState): Server {
     res.on('finish', () => logAccess())
     res.on('close', () => { if (!res.writableFinished) logAccess('(client closed)') })
     try {
+      if (!tokenProtected && (!hostAllowed(req, cfg) || !originAllowed(req))) {
+        logLine(`[cmdgo] 拒绝跨源/异常 Host 请求 ${req.method ?? '?'} ${pathname} host=${req.headers.host ?? '?'} origin=${req.headers.origin ?? '-'}（经反向代理或域名访问时，请把该域名加入 config.json 的 allowedHosts）`)
+        json(res, 403, { ok: false, error: 'forbidden: cross-origin or unrecognized host' })
+        return
+      }
+      if (req.method === 'OPTIONS') {
+        // Same-origin console traffic never preflights; only the token-protected
+        // surface answers cross-origin preflights at all.
+        if (tokenProtected) {
+          cors(res)
+          res.statusCode = 204
+        } else {
+          res.statusCode = 403
+        }
+        res.end()
+        return
+      }
       // 控制台页面（本机管理面，不开鉴权；监听非回环地址时注意局域网暴露）。
       if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
         if (indexCache === undefined) {
@@ -479,6 +559,7 @@ export function createBridgeServer(state: BridgeState): Server {
         return
       }
       if (pathname.startsWith('/v1/')) {
+        cors(res)
         if (!authorized(req)) {
           json(res, 401, openaiErrorBody('无效或缺失的 API key（Authorization: Bearer <key>）', 'invalid_api_key'))
           return
@@ -502,7 +583,10 @@ export function createBridgeServer(state: BridgeState): Server {
       json(res, 404, { ok: false, error: `not found: ${pathname}` })
     } catch (error) {
       if (res.writableEnded) return
-      json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
+      // A client fault (oversized body, unparseable JSON) keeps its own status
+      // instead of being flattened into a 500.
+      const status = error instanceof ClientError ? error.httpStatus : 500
+      json(res, status, { ok: false, error: error instanceof Error ? error.message : String(error) })
     }
   }
 
@@ -520,7 +604,11 @@ export function createBridgeServer(state: BridgeState): Server {
     const next = entries.map(entry => ({
       id: entry.id,
       name: entry.name,
-      contextWindow: entry.contextWindow,
+      // `defaultContextWindow` is the configured fallback for models whose
+      // listing entry discloses no capacity. Always reporting a number is what
+      // lets a client clamp `max_tokens` and tell a truncated reply apart from
+      // a finished one.
+      contextWindow: entry.contextWindow ?? cfg.defaultContextWindow,
       ...(efforts.get(entry.id) === undefined ? {} : { efforts: efforts.get(entry.id)! }),
     }))
     const same = next.length === holder.current.length
@@ -558,6 +646,7 @@ export function buildState(cfg: ServerConfig, dataDir: string): BridgeState {
   const credentials = new FileCredentials(dataDir)
   return {
     cfg,
+    dataDir,
     credentials,
     pool: new AccountPool({ baseRef: 'COMMANDCODE_API_KEY', dataDir, log: (m) => console.log(`[cmdgo] ${m}`) }),
     login: new CommandCodeLoginManager((m) => console.log(`[cmdgo] ${m}`)),

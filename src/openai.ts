@@ -54,7 +54,7 @@ const FAILOVER_CODES = new Set(['AUTH', 'RATE_LIMIT', 'SERVER', 'TRANSPORT'])
 const MAX_FAILOVER_ATTEMPTS = 4
 
 /** Total per-request budget for a single upstream exchange. */
-export const REQUEST_TIMEOUT_MS = 300_000
+export const REQUEST_TIMEOUT_MS = 600_000
 
 /** CLI-shaped session id, mirroring the id the official `cmd` CLI mints. */
 const SESSION_ID = `cli-${new Date().toISOString().replace(/\.\d{3}Z$/, '').replace(/:/g, '-')}`
@@ -219,6 +219,8 @@ export function clientStatus(code: string): number {
       return 400
     case 'TIMEOUT':
       return 504
+    case 'NO_ENABLED_ACCOUNT':
+      return 503
     default:
       return 502
   }
@@ -292,12 +294,26 @@ async function* gatewayStream(
  * answer must never be silently replayed.
  */
 export async function* openGateway(req: ChatRequest, ctx: CompletionContext): AsyncGenerator<CcStreamEvent> {
+  // The pool loads lazily from disk while `pick()` reads in-memory state
+  // synchronously, so a request arriving before the first load would see an
+  // empty pool and be rejected with a bogus MISSING_CREDENTIAL.
+  await ctx.pool.ensureLoaded()
   const attempts = Math.max(1, Math.min(Math.max(1, ctx.pool.size), MAX_FAILOVER_ATTEMPTS))
   for (let attempt = 0; attempt < attempts; attempt++) {
     const account = ctx.pool.size > 0 ? ctx.pool.pick() : undefined
-    const apiKey = account === undefined ? undefined : await ctx.pool.keyOf(ctx.credentials, account)
-    if (account === undefined || apiKey === undefined) {
-      throw new GatewayError('没有可用的 Command Code 账号凭据；请先在控制台完成 OAuth 登录', 401, 'MISSING_CREDENTIAL')
+    if (account === undefined) {
+      const empty = ctx.pool.size === 0
+      throw new GatewayError(
+        empty
+          ? '没有可用的 Command Code 账号凭据；请先在控制台完成 OAuth 登录'
+          : '账号池中没有任何已启用的账号；请在控制台启用至少一个账号',
+        empty ? 401 : 503,
+        empty ? 'MISSING_CREDENTIAL' : 'NO_ENABLED_ACCOUNT',
+      )
+    }
+    const apiKey = await ctx.pool.keyOf(ctx.credentials, account)
+    if (apiKey === undefined) {
+      throw new GatewayError(`账号 ${account.id} 的凭据缺失；请在控制台重新登录`, 401, 'MISSING_CREDENTIAL')
     }
     ctx.onAccount?.(account)
     let yielded = false
@@ -328,7 +344,15 @@ export interface Accumulator {
   reasoning: string
   toolCalls: ToolCallRecord[]
   finishReason: string | null
-  promptTokens: number
+  /**
+   * Uncached input tokens, disjoint from `cacheReadTokens`.
+   *
+   * The gateway reports the two halves separately (`noCacheTokens` /
+   * `cacheReadTokens`), which is not the OpenAI wire convention: there
+   * `prompt_tokens` is the total input and `cached_tokens` a subset of it.
+   * The halves are summed only at serialization — see {@link usageObject}.
+   */
+  uncachedInputTokens: number
   completionTokens: number
   cacheReadTokens: number
   reasoningTokens: number
@@ -340,7 +364,7 @@ export function emptyAccumulator(): Accumulator {
     reasoning: '',
     toolCalls: [],
     finishReason: null,
-    promptTokens: 0,
+    uncachedInputTokens: 0,
     completionTokens: 0,
     cacheReadTokens: 0,
     reasoningTokens: 0,
@@ -382,7 +406,7 @@ export function applyEvent(acc: Accumulator, event: CcStreamEvent): void {
         const cacheRead = optionalNumber(inputDetails?.cacheReadTokens)
         const noCache = optionalNumber(inputDetails?.noCacheTokens)
         const totalInput = optionalNumber(usage.inputTokens)
-        acc.promptTokens = noCache ?? (totalInput !== undefined && cacheRead !== undefined
+        acc.uncachedInputTokens = noCache ?? (totalInput !== undefined && cacheRead !== undefined
           ? Math.max(0, totalInput - cacheRead)
           : totalInput) ?? 0
         acc.cacheReadTokens = cacheRead ?? 0
@@ -421,11 +445,28 @@ export function chatCompletionId(): string {
   return `chatcmpl-${randomBytes(8).toString('hex')}`
 }
 
-function usageObject(acc: Accumulator): unknown {
+/**
+ * OpenAI-shaped usage for one completion.
+ *
+ * `prompt_tokens` must be the TOTAL input, with
+ * `prompt_tokens_details.cached_tokens` a subset of it
+ * (`cached_tokens <= prompt_tokens`). The gateway reports the uncached and
+ * cached halves disjointly, so they are summed here.
+ *
+ * Emitting the uncached half alone puts `cached_tokens` above `prompt_tokens`,
+ * and every spec-compliant consumer that derives the uncached remainder by
+ * subtraction (`prompt_tokens - cached_tokens` — the harness TokenUsage
+ * contract requires exactly that) clamps the result to zero: the uncached
+ * count vanishes and the full-rate portion goes unbilled.
+ *
+ * Exported so the streaming and non-streaming paths cannot drift apart.
+ */
+export function usageObject(acc: Accumulator): unknown {
+  const promptTokens = acc.uncachedInputTokens + acc.cacheReadTokens
   return {
-    prompt_tokens: acc.promptTokens,
+    prompt_tokens: promptTokens,
     completion_tokens: acc.completionTokens,
-    total_tokens: acc.promptTokens + acc.completionTokens,
+    total_tokens: promptTokens + acc.completionTokens,
     prompt_tokens_details: { cached_tokens: acc.cacheReadTokens },
     completion_tokens_details: { reasoning_tokens: acc.reasoningTokens },
   }
