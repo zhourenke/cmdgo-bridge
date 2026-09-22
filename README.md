@@ -2,6 +2,8 @@
 
 把 **Command Code Go 套餐**接入任意 Agent 工具的本地桥接服务。
 
+> 本仓库是 [Patrick-mufeng/cmdgo-bridge](https://github.com/Patrick-mufeng/cmdgo-bridge) 的 fork，上游提交历史完整保留。在原版基础上做了一轮完整审计与缺陷修复：协议合规与用量统计、并发与持久化竞态、管理面安全边界、上游连接泄漏，并补齐了一套零依赖回归测试（`npm test`）。
+
 Command Code 的订阅分两种:标准 Provider API(OpenAI 兼容,任何工具可直连)和 **Go 套餐**($1/月)。Go 套餐调官方 OpenAI 端点返回 `403 upgrade_required`,只能走 CLI 私有网关 `POST /alpha/generate`。本项目把 Go 订阅包装成 **OpenAI 兼容 API**——Cherry Studio、Cline、Roo Code、Continue、Cursor、ZCode 等所有支持自定义 OpenAI 端点的工具都能直接用,自带 Web 控制台完成 OAuth 登录与多账号池管理。
 
 ## 功能特性
@@ -26,7 +28,7 @@ Command Code 的订阅分两种:标准 Provider API(OpenAI 兼容,任何工具�
 ### 2. 获取项目
 
 ```sh
-git clone https://github.com/Patrick-mufeng/cmdgo-bridge.git
+git clone https://github.com/zhourenke/cmdgo-bridge.git
 cd cmdgo-bridge
 ```
 

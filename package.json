@@ -34,7 +34,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Patrick-mufeng/cmdgo-bridge.git"
+    "url": "git+https://github.com/zhourenke/cmdgo-bridge.git"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
