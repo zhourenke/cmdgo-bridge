@@ -240,10 +240,12 @@ function declaredOversize(path) {
       const chunks = []
       const value = () => ({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') })
       res.on('data', (chunk) => chunks.push(chunk))
-      // Either event may arrive first; the server sends `Connection: close` for a
-      // 413, so `close` can win the race. Whichever lands first resolves.
+      // Either event may arrive first; the server sends `Connection: close` for a 413, so
+      // `close` can win the race. Whichever lands first resolves — but the `close` path
+      // must defer one tick so any pending `data`/`end` is processed first; otherwise a
+      // whole 413 body can be reported as truncated. See test/helpers/response-body.mjs.
       res.on('end', () => finish(value()))
-      res.on('close', () => finish(value()))
+      res.on('close', () => setImmediate(() => finish(value())))
       // A 413 closes the connection while request bytes are still queued, and the
       // client tears the request down as soon as the answer arrives. The resulting
       // `ECONNRESET` therefore lands on the RESPONSE object a tick later, after the

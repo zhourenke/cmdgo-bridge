@@ -101,9 +101,12 @@ async function boot(options = {}) {
       res.on('data', (c) => chunks.push(c))
       const finish = () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') })
       res.on('end', finish)
-      // resolve on close too, so a truncated body fails an assertion instead of
-      // leaving the request pending until the runner's timeout
-      res.on('close', finish)
+      // Resolve on close too, so a truncated body fails an assertion instead of leaving
+      // the request pending until the runner's timeout — but defer first, and only when
+      // the message was received in full. See test/helpers/response-body.mjs: resolving
+      // `close` directly lets it beat the pending `end` and report a COMPLETE response as
+      // truncated, which is how a clean SSE stream lost its trailing `data: [DONE]`.
+      res.on('close', () => setImmediate(finish))
     })
     req.on('error', reject)
     req.end(payload)

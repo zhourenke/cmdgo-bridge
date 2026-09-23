@@ -75,6 +75,14 @@ async function boot(scenario) {
 function post(port, path, payload) {
   const body = JSON.stringify(payload)
   return new Promise((resolve, reject) => {
+    let settled = false
+    let status = 0
+    const chunks = []
+    const settle = () => {
+      if (settled) return
+      settled = true
+      resolve({ status, body: Buffer.concat(chunks).toString('utf8') })
+    }
     const req = request({
       host: '127.0.0.1',
       port,
@@ -87,16 +95,40 @@ function post(port, path, payload) {
         'content-length': Buffer.byteLength(body),
       },
     }, (res) => {
-      const chunks = []
-      const finish = () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') })
+      status = res.statusCode
       res.on('data', (c) => chunks.push(c))
-      res.on('end', finish)
-      // `end` is the normal path. `close` without `end` means the peer went away
-      // mid-response; resolving with what arrived lets the assertion report the
-      // truncation instead of the test hanging until the runner's timeout.
-      res.on('close', finish)
+      // `end` is the authoritative signal: by the time it fires, the whole message
+      // body has been read. Nothing else may resolve first.
+      res.on('end', settle)
+      // `close` is only a fallback, and it must always defer one tick before settling.
+      //
+      // Resolving straight from `close` was a bug in this helper: `close` can be
+      // observed before the last `data` event and before `end`, so the promise settled
+      // with a partial body — a valid, complete response silently reported as
+      // truncated. That produced failures whose symptoms pointed at the code under test
+      // rather than at the helper: a clean SSE stream losing its trailing
+      // `data: [DONE]` (failing an assertion about finish reasons), and a cleanly ended
+      // stream being discarded.
+      //
+      // `setImmediate` is what makes this safe, and it is why no `res.complete` check is
+      // needed: it runs after every pending `data` event and after `end`, so a whole
+      // body is always collected first. A genuinely cut-off response still resolves —
+      // with whatever did arrive — instead of hanging until the runner's timeout.
+      res.on('close', () => setImmediate(settle))
+      // A reset on the response itself must not become an unhandled error attributed
+      // to whichever test happens to be running; see test/helpers/tolerate-socket-errors.mjs.
+      res.on('error', settle)
     })
-    req.on('error', reject)
+    req.on('error', (error) => {
+      // A reset after the answer already resolved is this client's own teardown (the
+      // bridge destroys sockets at the end of a stream), not a failure to report.
+      if (settled) return
+      reject(error)
+    })
+    req.once('socket', (socket) => {
+      // Same reason as the response listener: the reset can land on the socket.
+      socket.on('error', () => {})
+    })
     req.end(body)
   })
 }

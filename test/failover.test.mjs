@@ -182,7 +182,10 @@ async function boot(baseURL, { accountCount = 2 } = {}) {
         }
         res.on('data', (c) => chunks.push(c))
         res.on('end', finish)
-        res.on('close', finish)
+        // Defer to the pending `end` when the message arrived whole; resolving `close`
+        // directly can beat it and report a COMPLETE body as truncated. See
+        // test/helpers/response-body.mjs.
+        res.on('close', () => setImmediate(finish))
       })
       req.on('error', reject)
       req.end(body)
