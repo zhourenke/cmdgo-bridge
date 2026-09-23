@@ -29,6 +29,7 @@ import {
   emptyAccumulator,
   openGateway,
   parseChatRequest,
+  poolState,
   usageObject,
 } from './openai.js'
 import type { ChatRequest, Accumulator } from './openai.js'
@@ -361,6 +362,17 @@ export function createBridgeServer(state: BridgeState): Server {
 
     // 流式：请求校验一过就提交 SSE 头——真实网关首 token 可能数秒，
     // 等上游首个事件再发头会让带首字节超时的客户端误判连接失败。
+    //
+    // 但「根本发不出去」的请求（空池 / 凭据缺失）必须在提交头之前就失败：
+    // 头一旦发出，状态码被冻结在 200，客户端只会看到「200 + 空回答」，
+    // 把一次从未发生的上游调用记成成功。这里用与故障转移循环同一套错误。
+    const preflight = await poolState(ctx)
+    if (preflight !== undefined) {
+      json(res, preflight.httpStatus, openaiErrorBody(preflight.message, preflight.code))
+      logOutcome(`error ${preflight.code}`, preflight.message)
+      return
+    }
+
     res.statusCode = 200
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
     res.setHeader('Cache-Control', 'no-cache')
@@ -423,6 +435,7 @@ export function createBridgeServer(state: BridgeState): Server {
       }
     }
 
+    let failed = false
     try {
       for await (const event of openGateway(chat, ctx)) {
         apply(event)
@@ -430,6 +443,7 @@ export function createBridgeServer(state: BridgeState): Server {
       }
       logOutcome('ok')
     } catch (error) {
+      failed = true
       const message = error instanceof Error ? error.message : String(error)
       const code = error instanceof GatewayError ? error.code
         : error instanceof ClientError ? 'invalid_request_error'
@@ -439,9 +453,17 @@ export function createBridgeServer(state: BridgeState): Server {
       emit({ ...meta, choices: [], error: { message, type: code, code } })
     }
     if (!res.writableEnded) {
-      emit(choice({}, acc.finishReason ?? 'stop'))
-      emit({ ...meta, choices: [], usage: usageObject(acc) })
-      res.end('data: [DONE]\n\n')
+      if (failed) {
+        // 失败流只发错误事件。补一个 finish_reason 或 usage 会把截断伪装成
+        // 正常结束：全 0 的 usage 在下游账本里与「成功且免费」无法区分，
+        // [DONE] 则让等待终止哨兵的客户端认为回答完整。直接结束连接，
+        // 让缺少 [DONE] 本身成为可判定的终止信号。
+        res.end()
+      } else {
+        emit(choice({}, acc.finishReason ?? 'stop'))
+        emit({ ...meta, choices: [], usage: usageObject(acc) })
+        res.end('data: [DONE]\n\n')
+      }
     }
   }
 

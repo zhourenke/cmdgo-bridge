@@ -371,6 +371,52 @@ async function* gatewayStream(
 }
 
 /**
+ * Resolves the pool account and upstream key for one attempt.
+ *
+ * Shared by {@link openGateway} and {@link preflightAccount} so the streaming
+ * path can surface a missing credential *before* committing SSE headers
+ * without duplicating — and drifting from — the failover loop's error codes.
+ * Errors are `GatewayError`s whose `httpStatus`/`code` the caller passes
+ * straight to the client: 401 `MISSING_CREDENTIAL` for an empty pool or a lost
+ * key, 503 `NO_ENABLED_ACCOUNT` when every account is switched off.
+ */
+async function resolveAccount(ctx: CompletionContext): Promise<{ account: PoolAccount; apiKey: string }> {
+  const account = ctx.pool.size > 0 ? ctx.pool.pick() : undefined
+  if (account === undefined) {
+    const empty = ctx.pool.size === 0
+    throw new GatewayError(
+      empty
+        ? '没有可用的 Command Code 账号凭据；请先在控制台完成 OAuth 登录'
+        : '账号池中没有任何已启用的账号；请在控制台启用至少一个账号',
+      empty ? 401 : 503,
+      empty ? 'MISSING_CREDENTIAL' : 'NO_ENABLED_ACCOUNT',
+    )
+  }
+  const apiKey = await ctx.pool.keyOf(ctx.credentials, account)
+  if (apiKey === undefined) {
+    throw new GatewayError(`账号 ${account.id} 的凭据缺失；请在控制台重新登录`, 401, 'MISSING_CREDENTIAL')
+  }
+  return { account, apiKey }
+}
+
+/**
+ * Reports whether a request can reach the gateway at all, without resolving an
+ * account or advancing the round-robin cursor.
+ *
+ * The streaming path calls this before `flushHeaders()`: once SSE headers are
+ * on the wire the status code is frozen at 200, so a request that could never
+ * start (no account, no key) would otherwise reach the client as a 200 with an
+ * empty answer instead of a 401/503 it can act on.
+ */
+export async function poolState(ctx: CompletionContext): Promise<GatewayError | undefined> {
+  await ctx.pool.ensureLoaded()
+  if (ctx.pool.size === 0) {
+    return new GatewayError('没有可用的 Command Code 账号凭据；请先在控制台完成 OAuth 登录', 401, 'MISSING_CREDENTIAL')
+  }
+  return undefined
+}
+
+/**
  * Stream gateway events for one completion, failing over to the next pool
  * account on pre-first-byte auth / rate-limit / server / transport errors.
  * Once an event has been yielded, errors propagate unchanged — a half-delivered
@@ -381,23 +427,14 @@ export async function* openGateway(req: ChatRequest, ctx: CompletionContext): As
   // synchronously, so a request arriving before the first load would see an
   // empty pool and be rejected with a bogus MISSING_CREDENTIAL.
   await ctx.pool.ensureLoaded()
+  // Resolve once up front so the pre-yield failure path can reuse the exact
+  // error the loop would have thrown. `attempts` stays keyed off the pool size,
+  // and only the loop below consumes a round-robin cursor slot.
+  const preflight = await poolState(ctx)
+  if (preflight !== undefined) throw preflight
   const attempts = Math.max(1, Math.min(Math.max(1, ctx.pool.size), MAX_FAILOVER_ATTEMPTS))
   for (let attempt = 0; attempt < attempts; attempt++) {
-    const account = ctx.pool.size > 0 ? ctx.pool.pick() : undefined
-    if (account === undefined) {
-      const empty = ctx.pool.size === 0
-      throw new GatewayError(
-        empty
-          ? '没有可用的 Command Code 账号凭据；请先在控制台完成 OAuth 登录'
-          : '账号池中没有任何已启用的账号；请在控制台启用至少一个账号',
-        empty ? 401 : 503,
-        empty ? 'MISSING_CREDENTIAL' : 'NO_ENABLED_ACCOUNT',
-      )
-    }
-    const apiKey = await ctx.pool.keyOf(ctx.credentials, account)
-    if (apiKey === undefined) {
-      throw new GatewayError(`账号 ${account.id} 的凭据缺失；请在控制台重新登录`, 401, 'MISSING_CREDENTIAL')
-    }
+    const { account, apiKey } = await resolveAccount(ctx)
     ctx.onAccount?.(account)
     let yielded = false
     try {
