@@ -371,8 +371,19 @@ export function createBridgeServer(state: BridgeState): Server {
   // 延迟，并让坏清单在启动日志里尽早暴露。
   void pool.list().catch(() => {})
 
-  /** 模型目录实时视图；sync() 换入新目录后接口立刻可见。 */
-  const holder: { current: BridgeModel[] } = { current: [] }
+  /**
+   * 模型目录实时视图；sync() 换入新目录后接口立刻可见。
+   *
+   * `syncedAt` 是目录**成功换入**的时刻，用于 `/v1/models` 的 `created`。
+   * 之前该字段恒为 0，而 OpenAI 规范里它是 Unix 时间戳——用 0 的客户端会认为
+   * 每个模型"创建于 1970 年"，按它做缓存或排序都会出错。目录本身不带创建时间
+   * （上游 listing 没有这个字段），所以"本桥看到它的时间"是最贴近语义的诚实取值。
+   * 初值取进程启动秒：目录尚未同步成功时也不能是 0，否则又是同一个坑。
+   */
+  const holder: { current: BridgeModel[]; syncedAt: number } = {
+    current: [],
+    syncedAt: Math.floor(Date.now() / 1000),
+  }
   const models = (): readonly BridgeModel[] => holder.current
   let indexCache: string | undefined
   void readFile(INDEX_FILE, 'utf8').then((text) => { indexCache = text }).catch(() => { indexCache = undefined })
@@ -498,14 +509,27 @@ export function createBridgeServer(state: BridgeState): Server {
 
   /* ---------------- /v1/* : OpenAI 兼容面 ---------------- */
 
+  /**
+   * 模型提供方，取自 id 的 `<vendor>/<model>` 前缀。
+   *
+   * 原来硬编码 `'commandcode'`，于是 deepseek / Qwen / MiniMaxAI 等真实提供方
+   * 在下游全部落到同一组——按 `owned_by` 做提供方归因、计费分组或路由的客户端
+   * 拿不到任何区分度。前缀缺失（例如 `gpt-5.6-luna`）时才回落到 `'commandcode'`，
+   * 因为那种 id 不携带提供方信息，编一个名字不如说明这是 Command Code 侧的条目。
+   */
+  function ownerOf(id: string): string {
+    const slash = id.indexOf('/')
+    return slash > 0 ? id.slice(0, slash) : 'commandcode'
+  }
+
   function handleModelsList(_req: IncomingMessage, res: ServerResponse): void {
     json(res, 200, {
       object: 'list',
       data: models().map(m => ({
         id: m.id,
         object: 'model',
-        created: 0,
-        owned_by: 'commandcode',
+        created: holder.syncedAt,
+        owned_by: ownerOf(m.id),
         // Not part of the OpenAI schema, but the field clients actually read
         // for this (it is also what Command Code's own listing discloses, and
         // the first name DSH's discovery tries). A client without it can only
@@ -1065,6 +1089,7 @@ export function createBridgeServer(state: BridgeState): Server {
       && next.every((m, i) => m.id === holder.current[i]?.id)
     if (same) return
     holder.current = next
+    holder.syncedAt = Math.floor(Date.now() / 1000)
     console.log(`[cmdgo] synced ${next.length} Go model(s): ${next.map(m => m.id).join(', ')}`)
   }
   void sync().catch((error: unknown) => {
