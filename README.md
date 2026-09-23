@@ -217,7 +217,19 @@ curl.exe -s -o NUL -w "new=%{http_code}`n" -H "Authorization: Bearer <新token>"
 - **Windows 上这是 no-op**：Node 只把 mode 位映射到"只读"属性，真正的保护来自 NTFS ACL。收紧失败会打一行 `[cmdgo] 无法收紧 … 权限` 到 stderr，但**不会阻止启动**——加固措施不该变成一次宕机。
 - 审计实测（Linux 数据目录）曾为 `config.json` / `credentials.json` / `accounts.json` / `access.log` 全部 `0666`，即在共享主机上任何本地账号都能读到 key。
 
+### 模型目录的来源版本
 
+`reasoning_effort` 的元数据来自官方 CLI 包里的 `models.md`。该地址现在是**钉死版本**的：
+
+```
+https://cdn.jsdelivr.net/npm/command-code@1.31.0/dist/bundled/command-code-knowledge/reference/models.md
+```
+
+以前用的是 `command-code@latest`，而桥在每次上游调用里都**伪造 `CC_VERSION`**（同样是 `1.31.0`）。两者会形成指纹不一致：请求自称 1.31.0，模型元数据却可能来自更新的版本，于是"哪些模型存在""哪些支持 `reasoning_effort`"两处说法可能对不上。版本号从 `CC_VERSION` 插值而来，不重复写死，升级 CLI 版本时改一处即可。想验证钉死的那份文档确实存在（会联网）：
+
+```sh
+CMDGO_TEST_NETWORK=1 node --test test/catalog-pin.test.mjs
+```
 
 ## 并发与背压
 

@@ -8,8 +8,8 @@
  * `id` / `name` / `context_length`; reasoning-effort support is NOT part of
  * the Provider API, so effort metadata is merged from the model catalog the
  * official `command-code` CLI ships (`dist/bundled/command-code-knowledge/
- * reference/models.md`), fetched live from jsDelivr so it tracks the `latest`
- * release instead of a checked-in snapshot.
+ * reference/models.md`), fetched from jsDelivr at the CLI version this bridge
+ * impersonates rather than a moving `latest` tag (see `CATALOG_URL`).
  *
  * The Go membership rule mirrors the official plans/go page and the opencode
  * commandcode-go plugin:
@@ -22,6 +22,8 @@
  *
  * @module commandcode-go/models
  */
+
+import { CC_VERSION } from './protocol.js'
 
 export interface GoModel {
   id: string
@@ -120,8 +122,22 @@ export function parseCatalogEfforts(markdown: string): Map<string, string[]> {
 }
 
 const DEFAULT_MODELS_URL = 'https://api.commandcode.ai/provider/v1/models'
-/** Official CLI catalog served from npm; `@latest` tracks new releases. */
-const CATALOG_URL = 'https://cdn.jsdelivr.net/npm/command-code@latest/dist/bundled/command-code-knowledge/reference/models.md'
+/**
+ * Official CLI catalog served from npm, pinned to the CLI version the bridge
+ * impersonates.
+ *
+ * This used to track `@latest`. The bridge forges `CC_VERSION` (1.31.0) on every
+ * gateway call, so a model catalog from a NEWER CLI than the version it claims to
+ * be is a fingerprint mismatch: the request says 1.31.0 while the effort metadata
+ * comes from, say, 1.40.0, and the two can disagree about which models exist and
+ * which accept `reasoning_effort`. Pinning keeps the advertised identity and the
+ * fetched metadata describing the same release, and makes a catalog change arrive
+ * only when someone bumps the version deliberately (F-21).
+ *
+ * The version is derived from `CC_VERSION` rather than repeated, so the two cannot
+ * drift apart in a later edit.
+ */
+const CATALOG_URL = `https://cdn.jsdelivr.net/npm/command-code@${CC_VERSION}/dist/bundled/command-code-knowledge/reference/models.md`
 /** Single-request fetch budget for the catalog (the API listing is separate). */
 const CATALOG_TIMEOUT_MS = 30_000
 /** Single-request fetch budget for the model listing; without it a stalled
