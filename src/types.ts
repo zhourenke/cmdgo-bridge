@@ -23,6 +23,22 @@ export interface ReasoningBlock {
   text: string
 }
 
+/**
+ * An image attachment on a user message.
+ *
+ * Kept out of {@link Message.content} on purpose: `content` is the *text*
+ * pipeline (it feeds `flattenText`, tool-result bodies and assistant parts),
+ * and mirroring images there would put bytes on paths that must stay strings.
+ * `Message.extraContent` carries them instead.
+ */
+export interface ImageBlock {
+  type: 'image'
+  /** Sniffed, normalized media type: image/png | image/jpeg | image/gif | image/webp. */
+  mediaType: string
+  /** Standard padded base64 of the decoded bytes. */
+  dataBase64: string
+}
+
 export interface ToolCallBlock {
   type: 'tool-call'
   id: CallId
@@ -42,6 +58,12 @@ export type ContentBlock = TextBlock | ReasoningBlock | ToolCallBlock | ToolResu
 export interface Message {
   role: 'user' | 'assistant' | 'system' | 'tool'
   content: ContentBlock[]
+  /**
+   * Images attached to this message, in wire order. Only user messages carry
+   * them today. Serialized after the flattened text so a text-only request keeps
+   * its exact previous envelope (upstream prompt cache is a *prefix* cache).
+   */
+  extraContent?: ImageBlock[]
 }
 
 export interface ToolSchema {

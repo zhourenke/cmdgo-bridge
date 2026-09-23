@@ -9,6 +9,8 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { randomBytes } from 'node:crypto'
+import { DEFAULT_IMAGE_LIMITS } from './image.js'
+import type { ImageLimits } from './image.js'
 
 export interface ServerConfig {
   /** Listen host. Loopback only by default; the /v1 token protects wider binds. */
@@ -34,6 +36,8 @@ export interface ServerConfig {
    * so a DNS-rebound page cannot read the client API key.
    */
   allowedHosts: string[]
+  /** Image (`image_url`) intake limits. */
+  images: ImageLimits
 }
 
 export const DEFAULT_DATA_DIR = join(homedir(), '.cmdgo-bridge')
@@ -47,6 +51,27 @@ export function defaultConfig(): ServerConfig {
     maxTokens: 64_000,
     defaultContextWindow: 262_144,
     allowedHosts: [],
+    images: { ...DEFAULT_IMAGE_LIMITS },
+  }
+}
+
+/** Environment overrides, applied on top of the config file (ops convenience). */
+function applyImageEnv(cfg: ServerConfig, env: NodeJS.ProcessEnv): void {
+  const num = (name: string): number | undefined => {
+    const raw = env[name]
+    if (raw === undefined || raw.trim() === '') return undefined
+    const value = Number(raw)
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined
+  }
+  const mb = num('CMDGO_IMAGE_MAX_MB')
+  if (mb !== undefined) cfg.images.maxBytes = mb * 1024 * 1024
+  const perRequest = num('CMDGO_IMAGE_MAX_PER_REQUEST')
+  if (perRequest !== undefined) cfg.images.maxPerRequest = perRequest
+  const timeout = num('CMDGO_IMAGE_FETCH_TIMEOUT_MS')
+  if (timeout !== undefined) cfg.images.fetchTimeoutMs = timeout
+  const flag = env.CMDGO_IMAGE_ALLOW_PRIVATE_NETWORK
+  if (flag !== undefined && flag.trim() !== '') {
+    cfg.images.allowPrivateNetwork = /^(1|true|yes|on)$/i.test(flag.trim())
   }
 }
 
@@ -64,6 +89,15 @@ export class ConfigStore {
   }
 
   async load(): Promise<ServerConfig> {
+    // Environment overrides apply on every path, including first run and the
+    // corrupt-file recovery below: a return that skipped them would make
+    // CMDGO_IMAGE_* silently inert exactly when someone is recovering a service.
+    const resolved = await this.readConfigFile()
+    applyImageEnv(resolved, process.env)
+    return resolved
+  }
+
+  private async readConfigFile(): Promise<ServerConfig> {
     let raw: string
     try {
       raw = await readFile(this.file, 'utf8')
@@ -102,6 +136,21 @@ export class ConfigStore {
       cfg.allowedHosts = parsed.allowedHosts
         .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
         .map(name => name.trim().toLowerCase())
+    }
+    if (typeof parsed.images === 'object' && parsed.images !== null && !Array.isArray(parsed.images)) {
+      const raw = parsed.images as Partial<ImageLimits>
+      const positive = (value: unknown): number | undefined =>
+        typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+      const maxBytes = positive(raw.maxBytes)
+      if (maxBytes !== undefined) cfg.images.maxBytes = maxBytes
+      const maxPerRequest = positive(raw.maxPerRequest)
+      if (maxPerRequest !== undefined) cfg.images.maxPerRequest = maxPerRequest
+      const fetchTimeoutMs = positive(raw.fetchTimeoutMs)
+      if (fetchTimeoutMs !== undefined) cfg.images.fetchTimeoutMs = fetchTimeoutMs
+      if (typeof raw.maxRedirects === 'number' && Number.isSafeInteger(raw.maxRedirects) && raw.maxRedirects >= 0) {
+        cfg.images.maxRedirects = raw.maxRedirects
+      }
+      if (typeof raw.allowPrivateNetwork === 'boolean') cfg.images.allowPrivateNetwork = raw.allowPrivateNetwork
     }
     return cfg
   }

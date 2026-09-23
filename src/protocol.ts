@@ -3,6 +3,13 @@
  * `/alpha/generate` gateway envelope and parse its line-delimited JSON stream
  * back into events.
  *
+ * Message content carries text, but user messages may also carry image parts
+ * (`{ type: 'image', source: { type: 'base64', media_type, data } }`), which the
+ * gateway validates and the models do read — see `test/upstream-image-probe.mjs`
+ * for the envelope shapes that were probed and rejected. A message without
+ * images still serializes to a plain string so existing conversations keep
+ * their upstream prompt-cache prefix.
+ *
  * The Go plan is the only Command Code plan without Provider-API access, so
  * the standard OpenAI-compatible endpoints answer 403 `upgrade_required` for
  * a Go subscription. The CLI gateway at `POST /alpha/generate` is the
@@ -66,8 +73,26 @@ interface CcToolResultContent {
   output: { type: 'text' | 'error-text'; value: string }
 }
 
+/** Image content block, as verified against the live gateway. */
+interface CcImageContent {
+  type: 'image'
+  source: {
+    type: 'base64'
+    media_type: string
+    data: string
+  }
+}
+
+/** Text content block inside a user-message part array. */
+interface CcTextContent {
+  type: 'text'
+  text: string
+}
+
+type CcUserContent = string | Array<CcTextContent | CcImageContent>
+
 type CcMessage =
-  | { role: 'user'; content: string | unknown[] }
+  | { role: 'user'; content: CcUserContent }
   | { role: 'assistant'; content: Array<{ type: 'text'; text: string } | { type: 'reasoning'; text: string } | CcToolCallContent> }
   | { role: 'tool'; content: CcToolResultContent[] }
 
@@ -155,11 +180,34 @@ function safeParseJson(raw: string): unknown {
   }
 }
 
+/**
+ * Serialize a user/tool message.
+ *
+ * Cache-critical: a message with no images serializes to exactly the string
+ * content it always has. The upstream prompt cache is a *prefix* cache, so
+ * switching text-only requests to a part array would invalidate every cached
+ * token of every existing conversation. Images therefore switch the shape only
+ * for messages that actually carry them.
+ */
 function serializeUser(message: Message): CcMessage {
   const toolResults = message.content.filter(
     (block): block is Extract<ContentBlock, { type: 'tool-result' }> => block.type === 'tool-result',
   )
   const text = flattenText(message.content)
+  const images = message.extraContent ?? []
+  if (images.length > 0) {
+    // Text first, then images: the model reads the instruction before the pixels,
+    // and appending keeps the text prefix identical to the text-only case.
+    const parts: Array<CcTextContent | CcImageContent> = []
+    if (text.length > 0) parts.push({ type: 'text', text })
+    for (const image of images) {
+      parts.push({
+        type: 'image',
+        source: { type: 'base64', media_type: image.mediaType, data: image.dataBase64 },
+      })
+    }
+    return { role: 'user', content: parts }
+  }
   if (text.length > 0 || toolResults.length === 0) {
     return { role: 'user', content: text }
   }

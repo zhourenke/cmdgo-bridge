@@ -303,9 +303,13 @@ export function createBridgeServer(state: BridgeState): Server {
   async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     let body: Record<string, unknown>
     let chat: ChatRequest
+    // The abort controller is created before parsing because a remote image URL
+    // is fetched during parsing and must die with a disconnected client.
+    const controller = new AbortController()
+    res.on('close', () => controller.abort())
     try {
       body = await readBody(req)
-      chat = parseChatRequest(body)
+      chat = await parseChatRequest(body, { imageLimits: cfg.images, signal: controller.signal })
     } catch (error) {
       const message = error instanceof ClientError ? error.message : 'invalid request'
       const status = error instanceof ClientError ? error.httpStatus : 400
@@ -314,8 +318,6 @@ export function createBridgeServer(state: BridgeState): Server {
       return
     }
 
-    const controller = new AbortController()
-    res.on('close', () => controller.abort())
     const startedAt = Date.now()
     const ctx = {
       cfg,

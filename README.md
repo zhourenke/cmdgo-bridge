@@ -9,6 +9,7 @@ Command Code 的订阅分两种:标准 Provider API(OpenAI 兼容,任何工具�
 ## 功能特性
 
 - **OpenAI 兼容 API**:`POST /v1/chat/completions`(流式 / 非流式)、`GET /v1/models`,支持工具调用、`reasoning_effort`、`max_tokens`、`temperature` / `top_p`
+- **图片输入(多模态)**:`image_url` 支持内联 `data:` URL 与远程 `http(s)` 地址,落地为上游 `{ type:'image', source:{ type:'base64', … } }` 信封;模型确实能读像素(见下文「图片输入」)
 - **OAuth 登录**:控制台一键生成登录地址,浏览器授权后 API key 自动回收入池,免手动复制
 - **多账号池**:每完成一次登录新 key 自动成为独立账号,请求级 round-robin 摊薄额度;失败(401/403/429/5xx/网络错误)自动指数冷却并故障转移,绝不重放半截回答
 - **模型目录同步**:自动从官方目录拉取 Go 套餐可用模型(含 reasoning effort 元数据),15 分钟刷新
@@ -111,8 +112,15 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `maxTokens` | `64000` | 单次输出上限 |
 | `defaultContextWindow` | `262144` | 上游清单未披露容量时的兜底;正常情况用清单里的真实值,经 `/v1/models` 的 `context_length` 下发给客户端 |
 | `allowedHosts` | `[]` | 允许访问控制台 / 管理面的额外域名(经反向代理或局域网域名访问时填写);回环名、IP 字面量与 `host` 本身始终允许 |
+| `images.maxBytes` | `8388608` | 单张图片解码后字节上限 |
+| `images.maxPerRequest` | `12` | 单次请求图片数量上限(跨所有消息合计) |
+| `images.fetchTimeoutMs` | `15000` | 远程图片 URL 抓取超时 |
+| `images.maxRedirects` | `3` | 远程图片 URL 允许的重定向跳数 |
+| `images.allowPrivateNetwork` | `false` | 是否允许远程图片 URL 指向回环 / 内网地址 |
 
 命令行参数:`--host <addr>`、`--port <port>`、`--data-dir <dir>`、`--help`。注意:`--host` / `--port` 会**写回 `config.json` 持久化**,下次启动继续生效。
+
+图片限制也可用环境变量临时覆盖(优先级高于 `config.json`):`CMDGO_IMAGE_MAX_MB`、`CMDGO_IMAGE_MAX_PER_REQUEST`、`CMDGO_IMAGE_FETCH_TIMEOUT_MS`、`CMDGO_IMAGE_ALLOW_PRIVATE_NETWORK`。
 
 ## API 端点
 
@@ -127,6 +135,36 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `POST /api/account/toggle` `remove` | 无鉴权,仅同源 | 账号管理 |
 
 > 管理面(`/api/*`、`/health`、控制台页面)不携带 token,因此额外校验 `Origin` 同源与 `Host` 白名单:其它站点发起的跨源请求、以及把域名解析到回环地址的 DNS rebinding 都会被 403 拒绝。`/v1/*` 保持宽松 CORS,由 Bearer token 保护。
+
+## 图片输入
+
+`messages[].content` 里的 `image_url` 部分会被转换成上游网关接受的信封:
+
+```jsonc
+{ "role": "user", "content": [
+  { "type": "text", "text": "这张图里是什么?" },
+  { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0..." } }
+] }
+```
+
+支持的写法与行为:
+
+- 内联 `data:` URL(base64,`png` / `jpeg` / `gif` / `webp`);声明类型与实际字节不符时以**字节嗅探结果**为准
+- 远程 `http(s)` URL:由 bridge 代抓,带 SSRF 防护(解析后为回环 / 内网 / 链路本地地址直接拒绝,默认禁 `http` 到内网),限制体积、超时与重定向跳数
+- 别名 `input_image` 同样接受;`input_audio` / `input_file` / `video` 等明确返回 400(而不是静默丢弃,避免误以为已转写)
+- 图片体积超限、格式非法、数量超过 `images.maxPerRequest` 时返回 400,报文说明具体原因
+
+**缓存复用**:上游的 prompt cache 是**前缀缓存**,因此实现上刻意保证——不含图片的消息仍序列化为原来的纯字符串 `content`,与加入图片功能之前的信封逐字节一致;同一张图片的 base64 编码是确定性的(不重新编码)。所以纯文本会话不会因为本功能丢掉任何缓存,而带图会话只要图片字节不变,重复请求也能命中前缀缓存。
+
+**注意**:推理型模型的 `max_tokens` 会被思维链先消耗。带图请求若把 `max_tokens` 设得过小(例如 200),可能只输出空内容——此时 `usage.completion_tokens_details.reasoning_tokens` 已接近上限,把预算放宽即可,并非图片没被读到。
+
+排查上游信封是否仍被接受(会真实消耗额度):
+
+```sh
+node scripts/probes/upstream-image-probe.mjs    # 逐个试探信封形态
+node scripts/probes/upstream-image-probe2.mjs   # 用不可猜的图片验证「真的看得见」
+node scripts/probes/bridge-vision-e2e.mjs --base http://127.0.0.1:11435/v1   # 走 bridge 的端到端验证
+```
 
 ## 本地联调(无需真实订阅)
 

@@ -9,6 +9,8 @@
 
 import { randomBytes } from 'node:crypto'
 import type { ServerConfig } from './config.js'
+import { ImageBudget, ImageError, fetchImage, parseDataUrl } from './image.js'
+import type { ImageLimits } from './image.js'
 import type { AccountPool, CredentialsSeam, PoolAccount } from './pool.js'
 import {
   CC_VERSION,
@@ -19,7 +21,7 @@ import {
 } from './protocol.js'
 import type { CcStreamEvent } from './protocol.js'
 import { CallId } from './types.js'
-import type { ContentBlock, GenerateOptions, Message, ToolSchema } from './types.js'
+import type { ContentBlock, GenerateOptions, ImageBlock, Message, ToolSchema } from './types.js'
 
 /** Parsed and normalized chat completion request. */
 export interface ChatRequest {
@@ -69,8 +71,54 @@ function optionalString(value: unknown): string | undefined {
 
 /* ---------------- request parsing ---------------- */
 
-function parseContent(raw: unknown): ContentBlock[] {
+/**
+ * Parse one OpenAI content part that carries an image.
+ *
+ * Inline `data:` URLs are decoded directly; remote URLs are fetched under an
+ * SSRF guard. A malformed image is always a hard client error: silently dropping
+ * one would reproduce the exact silent-vision-failure this work removes.
+ */
+async function parseImageUrlPart(
+  part: Record<string, unknown>,
+  budget: ImageBudget,
+  limits: ImageLimits,
+  signal?: AbortSignal,
+): Promise<ImageBlock> {
+  const raw = part.image_url
+  const url = typeof raw === 'string'
+    ? raw
+    : isRecord(raw) ? optionalString(raw.url) : undefined
+  if (url === undefined) {
+    throw new ClientError('image_url part must carry a "url" (or be a plain string)')
+  }
+  budget.take()
+  let image
+  try {
+    image = url.startsWith('data:')
+      ? parseDataUrl(url, limits)
+      : await fetchImage(url, limits, signal)
+  } catch (error) {
+    if (error instanceof ImageError) throw new ClientError(`invalid image: ${error.message}`)
+    throw error
+  }
+  return { type: 'image', mediaType: image.mediaType, dataBase64: image.dataBase64 }
+}
+
+/**
+ * OpenAI content → text blocks plus, separately, image blocks.
+ *
+ * Images are returned as a side channel rather than mixed into the text blocks:
+ * `Message.content` feeds `flattenText` and the tool-result/assistant paths,
+ * which must stay string-only.
+ */
+export async function parseContent(
+  raw: unknown,
+  budget: ImageBudget,
+  limits: ImageLimits,
+  signal?: AbortSignal,
+): Promise<{ blocks: ContentBlock[]; images: ImageBlock[] }> {
   const blocks: ContentBlock[] = []
+  const images: ImageBlock[] = []
   if (typeof raw === 'string') {
     if (raw.length > 0) blocks.push({ type: 'text', text: raw })
   } else if (Array.isArray(raw)) {
@@ -78,27 +126,52 @@ function parseContent(raw: unknown): ContentBlock[] {
       if (!isRecord(part)) continue
       if (part.type === 'text' && typeof part.text === 'string' && part.text.length > 0) {
         blocks.push({ type: 'text', text: part.text })
+        continue
       }
-      // image_url parts are skipped: the gateway envelope in this bridge is text-only.
+      if (part.type === 'image_url' || part.type === 'input_image') {
+        images.push(await parseImageUrlPart(part, budget, limits, signal))
+        continue
+      }
+      // `input_image` is handled above; anything else in the audio/video/file
+      // families is refused rather than dropped, so a caller cannot believe a
+      // transcription happened when the part was silently discarded.
+      if (typeof part.type === 'string' && /^(input_)?(audio|video|file)/.test(part.type)) {
+        throw new ClientError(`unsupported content part type: "${part.type}"`)
+      }
+      // Unknown part types stay ignored, matching the previous behaviour.
     }
+  } else if (raw !== undefined && raw !== null) {
+    throw new ClientError('message "content" must be a string or an array')
   }
-  return blocks
+  return { blocks, images }
 }
 
 /** OpenAI chat messages → harness Message[] (system stays a role; buildRequest merges it). */
-function convertMessages(rawMessages: unknown): Message[] {
+export async function convertMessages(
+  rawMessages: unknown,
+  budget: ImageBudget,
+  limits: ImageLimits,
+  signal?: AbortSignal,
+): Promise<Message[]> {
   if (!Array.isArray(rawMessages)) throw new ClientError('"messages" must be an array')
   const messages: Message[] = []
   for (const raw of rawMessages) {
     if (!isRecord(raw)) throw new ClientError('every message must be an object')
     const role = raw.role
-    const blocks = parseContent(raw.content)
+    const { blocks, images } = await parseContent(raw.content, budget, limits, signal)
+    // Only user messages can carry pixels upstream (assistant turns are text +
+    // reasoning + tool calls, tool turns are results). Refusing the others is
+    // deliberate: attaching them and dropping the field would lose content
+    // silently, which is the failure mode this feature exists to remove.
+    if (images.length > 0 && role !== 'user') {
+      throw new ClientError(`image parts are only supported on user messages, not "${String(role)}"`)
+    }
     if (role === 'system' || role === 'developer') {
       messages.push({ role: 'system', content: blocks })
       continue
     }
     if (role === 'user') {
-      messages.push({ role: 'user', content: blocks })
+      messages.push(images.length === 0 ? { role: 'user', content: blocks } : { role: 'user', content: blocks, extraContent: images })
       continue
     }
     if (role === 'assistant' || role === 'reasoning') {
@@ -147,7 +220,16 @@ function optionalNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
-export function parseChatRequest(body: unknown): ChatRequest {
+export interface ParseRequestContext {
+  imageLimits: ImageLimits
+  /** Client-disconnect signal, so a remote image fetch dies with the request. */
+  signal?: AbortSignal
+}
+
+export async function parseChatRequest(
+  body: unknown,
+  ctx: ParseRequestContext,
+): Promise<ChatRequest> {
   if (!isRecord(body)) throw new ClientError('request body must be a JSON object')
   const model = optionalString(body.model)
   if (model === undefined) throw new ClientError('missing required field: "model"')
@@ -166,9 +248,10 @@ export function parseChatRequest(body: unknown): ChatRequest {
   }).filter(tool => tool.name.length > 0)
   const maxTokens = positiveInt(body.max_tokens, positiveInt(body.max_completion_tokens, undefined))
     ?? DEFAULT_MAX_TOKENS
+  const budget = new ImageBudget(ctx.imageLimits)
   return {
     model,
-    messages: convertMessages(body.messages),
+    messages: await convertMessages(body.messages, budget, ctx.imageLimits, ctx.signal),
     stream: body.stream === true,
     ...(maxTokens === undefined ? {} : { maxTokens }),
     ...(optionalNumber(body.temperature) === undefined ? {} : { temperature: optionalNumber(body.temperature) }),
