@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test \"test/*.test.mjs\"",
+    "test": "npm run build && node --test test/bom.test.mjs test/capacity.test.mjs test/catalog-pin.test.mjs test/chat.test.mjs test/config.test.mjs test/context-window.test.mjs test/credentials.test.mjs test/failover.test.mjs test/faults.test.mjs test/file-permissions.test.mjs test/host.test.mjs test/image-allow-remote.test.mjs test/image-base64.test.mjs test/image-fetch.test.mjs test/image-serialization.test.mjs test/image.test.mjs test/loopback-port.test.mjs test/models-metadata.test.mjs test/models.test.mjs test/observability.test.mjs test/oversize.test.mjs test/params.test.mjs test/pool.test.mjs test/protocol.test.mjs test/readme-consistency.test.mjs test/reasoning.test.mjs test/rotate-key.test.mjs test/server.test.mjs test/shutdown.test.mjs test/ssrf-linklocal.test.mjs test/test-script.test.mjs test/unsupported.test.mjs test/usage.test.mjs",
     "start": "node dist/index.js",
     "mock": "node scripts/mock-gateway.mjs"
   },
