@@ -58,6 +58,11 @@ async function bootBridge({ baseURL, seedPool = true }) {
         addedAt: Date.now(), enabled: true, failCount: 0,
       }],
     }), 'utf8')
+  }
+  // 'no-credential' seeds the account manifest but NOT the credential store, so
+  // the pool names an account the credential seam cannot resolve. Distinct from
+  // an empty pool: the failure has to come from resolution, not from selection.
+  if (seedPool && seedPool !== 'no-credential') {
     await writeFile(join(dataDir, 'credentials.json'), JSON.stringify({
       COMMANDCODE_API_KEY_ACCT: { value: 'user_goodkey', source: 'test' },
     }), 'utf8')
@@ -279,5 +284,143 @@ test('a clean stream still ends with exactly one [DONE] and one usage frame', as
   } finally {
     await bridge.teardown()
     await healthy.close()
+  }
+})
+
+/**
+ * A stream that ends cleanly without `finish-step`.
+ *
+ * This is the ambiguous case the F-13 fix has to get right in both directions:
+ * the text that arrived is real and must be delivered, but the gateway never
+ * said the model stopped, so `finish_reason` must be null rather than an
+ * invented `'stop'`. It must NOT be treated as a transport failure — the socket
+ * closed normally, which is a different event from a reset.
+ */
+test('a clean end without finish-step delivers the answer with finish_reason null (stream)', async () => {
+  const noFinish = await startFaultUpstream('no-finish-step')
+  bridge = await bootBridge({ baseURL: noFinish.baseURL })
+  try {
+    const res = await bridge.call('/v1/chat/completions', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: chatBody({ stream: true }),
+    })
+    assert.equal(res.status, 200)
+    const frames = sseFrames(res.body)
+    assert.equal(frames.at(-1), '[DONE]', 'a normally-ended stream still terminates the client')
+    const chunks = frames.filter((f) => f !== '[DONE]').map((f) => JSON.parse(f))
+    assert.ok(!chunks.some((c) => c.error !== undefined), 'a clean end is not an error')
+
+    const text = chunks.flatMap((c) => c.choices ?? []).map((c) => c.delta?.content ?? '').join('')
+    assert.equal(text, 'answer without finish step', 'the delivered text must not be discarded')
+
+    const terminal = chunks.find((c) => c.choices[0] !== undefined
+      && Object.keys(c.choices[0].delta ?? {}).length === 0)
+    assert.equal(terminal.choices[0].finish_reason, null,
+      'without finish-step the bridge cannot claim the model stopped')
+
+    // Usage must be synthesized from the deltas: reporting zeros over a complete
+    // answer books it downstream as a free success.
+    const usageFrames = chunks.filter((c) => c.usage !== undefined)
+    assert.equal(usageFrames.length, 1)
+    assert.ok(usageFrames[0].usage.completion_tokens > 0,
+      'a stream with no reported usage must still count what it delivered')
+  } finally {
+    await bridge.teardown()
+    await noFinish.close()
+  }
+})
+
+test('a clean end without finish-step is a 200 with the answer, not a 502 (non-stream)', async () => {
+  const noFinish = await startFaultUpstream('no-finish-step')
+  bridge = await bootBridge({ baseURL: noFinish.baseURL })
+  try {
+    const res = await bridge.call('/v1/chat/completions', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: chatBody({ stream: false }),
+    })
+    assert.equal(res.status, 200, 'a cleanly ended response is the answer, not a gateway failure')
+    const payload = JSON.parse(res.body)
+    assert.equal(payload.choices[0].message.content, 'answer without finish step')
+    assert.equal(payload.choices[0].finish_reason, null)
+    assert.ok(payload.usage.completion_tokens > 0)
+  } finally {
+    await bridge.teardown()
+    await noFinish.close()
+  }
+})
+
+/**
+ * A 200 with no body at all. There is no content and no reason, but the HTTP
+ * exchange itself succeeded — so this is an empty answer, not a broken bridge.
+ * What must not happen is a fabricated `'stop'` on a completion that carries
+ * nothing, which would look to a downstream ledger like a real, empty answer.
+ */
+test('an empty response body is an empty answer, not a fabricated success (stream)', async () => {
+  const empty = await startFaultUpstream('empty-body')
+  bridge = await bootBridge({ baseURL: empty.baseURL })
+  try {
+    const res = await bridge.call('/v1/chat/completions', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: chatBody({ stream: true }),
+    })
+    assert.equal(res.status, 200)
+    const frames = sseFrames(res.body)
+    assert.equal(frames.at(-1), '[DONE]', 'the stream still terminates cleanly')
+    const chunks = frames.filter((f) => f !== '[DONE]').map((f) => JSON.parse(f))
+    assert.ok(!chunks.some((c) => c.error !== undefined), 'an empty body is not a transport failure')
+    const terminal = chunks.find((c) => c.choices[0] !== undefined
+      && Object.keys(c.choices[0].delta ?? {}).length === 0)
+    assert.equal(terminal.choices[0].finish_reason, null)
+    const usage = chunks.find((c) => c.usage !== undefined)?.usage
+    assert.equal(usage.completion_tokens, 0, 'nothing was delivered, so nothing may be billed')
+  } finally {
+    await bridge.teardown()
+    await empty.close()
+  }
+})
+
+test('an empty response body is a 200 with empty content (non-stream)', async () => {
+  const empty = await startFaultUpstream('empty-body')
+  bridge = await bootBridge({ baseURL: empty.baseURL })
+  try {
+    const res = await bridge.call('/v1/chat/completions', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: chatBody({ stream: false }),
+    })
+    assert.equal(res.status, 200)
+    const payload = JSON.parse(res.body)
+    assert.equal(payload.choices[0].message.content, '')
+    assert.equal(payload.choices[0].finish_reason, null)
+    assert.equal(payload.usage.completion_tokens, 0)
+  } finally {
+    await bridge.teardown()
+    await empty.close()
+  }
+})
+
+/**
+ * Credential missing for an account that IS in the pool. Distinct from an empty
+ * pool: the manifest names an account the credential store cannot resolve, so
+ * the request must fail before committing SSE headers for the same reason.
+ */
+test('an account with no resolvable credential fails before the SSE headers', async () => {
+  const dataDirBridge = await bootBridge({ baseURL: upstream.baseURL, seedPool: 'no-credential' })
+  bridge = dataDirBridge
+  try {
+    const res = await bridge.call('/v1/chat/completions', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: chatBody({ stream: true }),
+    })
+    assert.ok(res.status >= 400, `expected a real error status, got ${res.status}: ${res.body.slice(0, 200)}`)
+    assert.ok((res.headers['content-type'] ?? '').includes('application/json'),
+      'the failure must not be an event stream')
+    assert.ok(JSON.parse(res.body).error.code.length > 0)
+  } finally {
+    await bridge.teardown()
   }
 })

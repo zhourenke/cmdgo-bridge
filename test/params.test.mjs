@@ -247,13 +247,12 @@ test('streaming reports an unknown finish reason as null too', async () => {
     const frames = res.body.split('\n\n').filter((f) => f.startsWith('data: ') && f !== 'data: [DONE]')
     const choices = frames.map((f) => JSON.parse(f.slice(6)))
     assert.ok(res.body.endsWith('data: [DONE]\n\n'), 'a clean stream still terminates with [DONE]')
-    // The terminal frame is the one with an empty delta; in-progress deltas carry
-    // content. Both report `finish_reason: null` here, so the empty delta is what
-    // identifies the end of the stream.
-    const terminal = choices.filter((c) => {
-      const choice = c.choices?.[0]
-      return choice !== undefined && Object.keys(choice.delta ?? {}).length === 0
-    })
+    // The terminal frame is the one choice whose delta is empty; in-progress
+    // deltas carry content. Both report `finish_reason: null` here, so the empty
+    // delta is what identifies the end. The usage frame is excluded because it
+    // carries no choices at all.
+    const terminal = choices.filter((c) => c.choices[0] !== undefined
+      && Object.keys(c.choices[0].delta ?? {}).length === 0)
     assert.equal(terminal.length, 1, `expected one terminal frame, got ${terminal.length}`)
     assert.equal(terminal[0].choices[0].finish_reason, null,
       'the terminal frame must not invent "stop" for an unrecognised reason')

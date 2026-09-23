@@ -404,9 +404,9 @@ async function* gatewayStream(
 /**
  * Resolves the pool account and upstream key for one attempt.
  *
- * Shared by {@link openGateway} and {@link preflightAccount} so the streaming
- * path can surface a missing credential *before* committing SSE headers
- * without duplicating — and drifting from — the failover loop's error codes.
+ * Shared by {@link openGateway} and {@link poolState} so the streaming path can
+ * surface a missing credential *before* committing SSE headers without
+ * duplicating — and drifting from — the failover loop's error codes.
  * Errors are `GatewayError`s whose `httpStatus`/`code` the caller passes
  * straight to the client: 401 `MISSING_CREDENTIAL` for an empty pool or a lost
  * key, 503 `NO_ENABLED_ACCOUNT` when every account is switched off.
@@ -431,20 +431,37 @@ async function resolveAccount(ctx: CompletionContext): Promise<{ account: PoolAc
 }
 
 /**
- * Reports whether a request can reach the gateway at all, without resolving an
- * account or advancing the round-robin cursor.
+ * Reports whether a request can reach the gateway at all, without advancing the
+ * round-robin cursor.
  *
- * The streaming path calls this before `flushHeaders()`: once SSE headers are
- * on the wire the status code is frozen at 200, so a request that could never
- * start (no account, no key) would otherwise reach the client as a 200 with an
- * empty answer instead of a 401/503 it can act on.
+ * The streaming path calls this before `flushHeaders()`: once SSE headers are on
+ * the wire the status code is frozen at 200, so a request that could never start
+ * would otherwise reach the client as a 200 plus an in-band error event, which a
+ * downstream ledger records as a completed (and therefore billable) request.
+ *
+ * Both failure modes are checked here for that reason:
+ *   - no account at all;
+ *   - accounts exist but not one of them has a resolvable credential, which is
+ *     what a hand-edited `credentials.json` or a cleared store produces. Checking
+ *     only the pool size let exactly that case through as a 200.
  */
 export async function poolState(ctx: CompletionContext): Promise<GatewayError | undefined> {
   await ctx.pool.ensureLoaded()
   if (ctx.pool.size === 0) {
     return new GatewayError('没有可用的 Command Code 账号凭据；请先在控制台完成 OAuth 登录', 401, 'MISSING_CREDENTIAL')
   }
-  return undefined
+  // No cursor movement: `keyOf` is a plain lookup, so the account the request
+  // actually uses is still chosen by the failover loop's own `pick()`.
+  for (const account of await ctx.pool.list()) {
+    try {
+      if (await ctx.pool.keyOf(ctx.credentials, account) !== undefined) return undefined
+    } catch (_resolveFailure) { /* 下一个 */ }
+  }
+  return new GatewayError(
+    '账号池中的账号都取不到凭据；请在控制台重新登录，或修好 credentials.json 后 POST /api/reload',
+    401,
+    'MISSING_CREDENTIAL',
+  )
 }
 
 /**
