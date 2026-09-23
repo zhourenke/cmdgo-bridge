@@ -11,8 +11,8 @@ import { appendFile } from 'node:fs/promises'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { timingSafeEqual } from 'node:crypto'
-import { DEFAULT_DATA_DIR } from './config.js'
+import { timingSafeEqual, randomBytes } from 'node:crypto'
+import { DEFAULT_DATA_DIR, ConfigStore } from './config.js'
 import type { ServerConfig } from './config.js'
 import { AccountPool } from './pool.js'
 import type { CredentialsSeam, PoolAccount } from './pool.js'
@@ -562,6 +562,37 @@ export function createBridgeServer(state: BridgeState): Server {
       await readBody(req)
       const removed = await pool.clear(credentials)
       json(res, 200, { ok: true, removed })
+      return
+    }
+    if (req.method === 'POST' && action === '/rotate-key') {
+      await readBody(req)
+      // Rotation changes the one credential `/v1/*` accepts, so it is restricted
+      // to loopback callers even though the rest of the admin surface is open to
+      // any host the `Host`/`Origin` checks admit. `authorized()` compares
+      // against `cfg.apiKey` on every request, so mutating it here — and
+      // persisting — takes effect immediately, with no restart and no window
+      // where both the old and the new token work.
+      if (!isLoopbackAddress(req.socket.remoteAddress)) {
+        logLine(`[cmdgo] 拒绝来自 ${req.socket.remoteAddress ?? '?'} 的 /api/rotate-key（仅允许回环来源）`)
+        json(res, 403, { ok: false, error: '轮换客户端 token 仅允许从本机（回环地址）发起' })
+        return
+      }
+      const previous = cfg.apiKey
+      cfg.apiKey = randomBytes(24).toString('hex')
+      try {
+        await new ConfigStore(state.dataDir).save(cfg)
+      } catch (error) {
+        // Keep the in-memory token in step with disk: a half-applied rotation
+        // would invalidate the old token at runtime while the file still holds
+        // it, so a later restart would silently resurrect the retired value.
+        cfg.apiKey = previous
+        const message = error instanceof Error ? error.message : String(error)
+        logLine(`[cmdgo] 轮换客户端 token 失败：${message}`)
+        json(res, 500, { ok: false, error: `写入 config.json 失败，未轮换：${message}` })
+        return
+      }
+      logLine('[cmdgo] 客户端 token 已轮换：旧值立即失效，新值已写入 config.json（无需重启）')
+      json(res, 200, { ok: true, apiKey: cfg.apiKey })
       return
     }
     json(res, 404, { ok: false, error: `unknown action: ${action}` })

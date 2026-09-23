@@ -234,7 +234,9 @@
             <input class="field" id="cfgApiKey" readonly type="password" value="">
             <button class="btn btn-sm" id="btnKeyToggle">显示</button>
             <button class="btn btn-sm" data-copy="cfgApiKey" id="btnKeyCopy">复制</button>
+            <button class="btn btn-sm" id="btnKeyRotate">轮换</button>
           </div>
+          <div class="hint">轮换后<b>旧 token 立即失效</b>，所有下游需换成新值；新值已写入 <code>config.json</code>，无需重启。仅允许从本机（回环地址）操作。</div>
           <span class="k">KEY REF</span>
           <div class="kv-row"><span class="v" id="cfgRef"></span></div>
         </div>
@@ -458,6 +460,28 @@ curl http://127.0.0.1:PORT/v1/chat/completions \
       var show = el.type === 'password';
       el.type = show ? 'text' : 'password';
       t.textContent = show ? '隐藏' : '显示';
+      return;
+    }
+    if (t.id === 'btnKeyRotate') {
+      if (typeof snap.apiKey !== 'string' || snap.apiKey.length === 0) {
+        showErr('非回环来源无法轮换 token：请在运行 cmdgo-bridge 的机器上打开控制台。');
+        return;
+      }
+      if (!window.confirm(
+        '确定轮换客户端 API key？\n\n'
+        + '· 旧 token 会【立即失效】，所有下游（室友/朋友的 Agent 工具）需立刻换成新值\n'
+        + '· 新值会写入 config.json，无需重启\n'
+        + '· 轮换不会影响上游 Command Code 账号的授权\n\n'
+        + '建议先准备好把新 key 分发出去。')) return;
+      t.disabled = true; t.textContent = '轮换中…';
+      api('/rotate-key', 'POST').then(function (data) {
+        if (!data.ok) throw new Error(data.error || '轮换失败');
+        $('cfgApiKey').value = data.apiKey;
+        $('cfgApiKey').type = 'text';
+        $('btnKeyToggle').textContent = '隐藏';
+        return refresh();
+      }).catch(function (err) { showErr(String(err.message || err)); })
+        .then(function () { t.disabled = false; t.textContent = '轮换'; });
       return;
     }
     if (t.id === 'btnKeyCopy' && snap) {

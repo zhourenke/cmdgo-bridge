@@ -133,12 +133,40 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `GET /api/status` | 无鉴权 | 登录 / 账号 / 模型状态快照;**仅回环来源**的响应包含 `apiKey` |
 | `POST /api/login` `cancel` `logout` | 无鉴权 | 登录生命周期 |
 | `POST /api/account/toggle` `remove` | 无鉴权 | 账号管理 |
+| `POST /api/rotate-key` | 无鉴权，**仅回环来源** | 轮换客户端 API key；返回新值，旧值**立即失效**，无需重启 |
 
 > **管理面（`/api/*`、`/health`、控制台页面）不携带 token**。它额外校验 `Origin` 同源与 `Host` 白名单:其它站点发起的**浏览器跨源请求**、以及把域名解析到回环地址的 DNS rebinding 都会被 403 拒绝。
 >
 > ⚠️ 这两道校验**只对浏览器有效**。`curl`、脚本、以及任何非浏览器客户端都不发送 `Origin`，因此会被直接放行——这正是「无 `Origin` 的真实请求返回 200」这一既有行为。所以**管理面的实际边界取决于监听地址**：保持默认 `127.0.0.1` 时只有本机可达；一旦绑定 `0.0.0.0`，网络内任何客户端都能读取 `apiKey` 并清空账号池。
 >
 > 为此设置了两道纵深防御：绑定非回环地址时启动会打印显著告警；`/api/status` 对**非回环来源**的请求不下发 `apiKey` 字段（控制台此时显示「非回环来源，已隐去」）。`/v1/*` 保持宽松 CORS，由 Bearer token 保护。
+
+### 轮换客户端 API key
+
+客户端 API key（`config.json` 的 `apiKey`）与上游 Command Code 账号凭据是**两个独立的东西**：前者是室友/朋友的 Agent 工具连本桥用的，后者是桥连上游用的。重新 OAuth 登录不会改变前者。
+
+怀疑前者泄露、或有人退出共享时，按下面任一种方式轮换：
+
+**方式一：控制台（推荐）**
+
+1. 在运行 cmdgo-bridge 的机器上打开 `http://127.0.0.1:11435/`（必须是本机——非回环来源看不到 key，也无法轮换）
+2. CONFIG 区 → API KEY 一行 → 点「轮换」
+3. 确认对话框会说明影响：旧 token 立即失效、新值写入 `config.json`、不影响上游授权
+4. 轮换后页面会直接显示新 key，用「复制」分发下去
+
+**方式二：命令行 runbook（控制台打不开时）**
+
+```powershell
+# 1) 生成新 token 并安全写回（node 写入 = 无 BOM；保留 config.json 其余所有字段）
+node -e "const fs=require('fs'),crypto=require('crypto'),p=process.argv[1];const c=JSON.parse(fs.readFileSync(p,'utf8'));c.apiKey=crypto.randomBytes(24).toString('hex');fs.writeFileSync(p,JSON.stringify(c,null,2),'utf8');console.log('new token written')" "$env:USERPROFILE\.cmdgo-bridge\config.json"
+
+# 2) 重启桥（token 在启动时读取，手工改文件不重启不生效）
+#    关掉那个 start.cmd 窗口，再在仓库目录执行 npm start
+# 3) 校验新 token 生效、旧 token 失效（把 <新token> 换成上一步打印的值）
+curl.exe -s -o NUL -w "new=%{http_code}`n" -H "Authorization: Bearer <新token>" http://127.0.0.1:11435/v1/models
+```
+
+> 两种方式的区别：控制台轮换**不需要重启**（`authorized()` 每次请求都读当前配置），命令行方式**必须重启**。手改文件时务必用无 BOM 的 UTF-8 写入——带 BOM 会让桥把 `config.json` 当成损坏文件并**重新随机生成**一个 key（见排错表）。
 
 ## 图片输入
 
