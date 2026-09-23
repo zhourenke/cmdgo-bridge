@@ -29,6 +29,7 @@ import { join } from 'node:path'
 import { removeDataDir } from './helpers/teardown.mjs'
 import { defaultConfig } from '../dist/config.js'
 import { buildState, createBridgeServer } from '../dist/server.js'
+import { listenOnFetchablePort } from './helpers/loopback-port.mjs'
 
 const API_KEY = 'observability-key-0123456789abcdef'
 const MODEL = 'xiaomi/mimo-v2.6-flash'
@@ -60,7 +61,7 @@ async function boot(options = {}) {
     for (const event of HEALTHY) res.write(`${JSON.stringify(event)}\n`)
     res.end()
   })
-  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+  await listenOnFetchablePort(upstream)
 
   const dataDir = await mkdtemp(join(tmpdir(), 'cmdgo-obs-'))
   const accounts = options.accounts ?? [

@@ -25,6 +25,7 @@ import { join } from 'node:path'
 
 import { ConfigStore, defaultConfig } from '../dist/config.js'
 import { DEFAULT_IMAGE_LIMITS, fetchImage, parseDataUrl } from '../dist/image.js'
+import { listenOnFetchablePort } from './helpers/loopback-port.mjs'
 
 /** A minimal valid PNG, so the magic-number sniff accepts it. */
 const PNG = Buffer.from(
@@ -48,7 +49,7 @@ before(async () => {
     res.end(PNG)
   })
   server.on('connection', () => { connections += 1 })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  await listenOnFetchablePort(server)
   pngUrl = `http://127.0.0.1:${server.address().port}/pixel.png`
 })
 

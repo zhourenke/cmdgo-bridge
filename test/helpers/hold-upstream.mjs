@@ -12,6 +12,7 @@
  * under `test/` as a test file.
  */
 import { createServer } from 'node:http'
+import { listenOnFetchablePort } from './loopback-port.mjs'
 
 /**
  * @param {{ mode?: 'hold' | 'flood', deltaBytes?: number, floodFrames?: number }} [options]
@@ -85,7 +86,7 @@ export async function startHoldingUpstream({ mode = 'hold', deltaBytes = 512, fl
     })
   })
 
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  await listenOnFetchablePort(server)
   const { port } = server.address()
   return {
     baseURL: `http://127.0.0.1:${port}`,

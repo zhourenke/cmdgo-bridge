@@ -29,6 +29,7 @@ import { removeDataDir } from './helpers/teardown.mjs'
 
 import { defaultConfig } from '../dist/config.js'
 import { buildState, createBridgeServer, isLoopbackHost } from '../dist/server.js'
+import { listenOnFetchablePort } from './helpers/loopback-port.mjs'
 
 /** Holds the fixture state so teardown can flush its pending writes. */
 let bridgeState
@@ -58,7 +59,7 @@ function freePort() {
   return new Promise((resolve, reject) => {
     const probe = createServer()
     probe.on('error', reject)
-    probe.listen(0, '127.0.0.1', () => {
+    listenOnFetchablePort(probe).then(() => {
       const { port } = probe.address()
       probe.close(() => resolve(port))
     })

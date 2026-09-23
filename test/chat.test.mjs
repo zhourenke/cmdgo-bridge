@@ -37,6 +37,7 @@ import { removeDataDir } from './helpers/teardown.mjs'
 
 import { defaultConfig } from '../dist/config.js'
 import { buildState, createBridgeServer } from '../dist/server.js'
+import { listenOnFetchablePort } from './helpers/loopback-port.mjs'
 
 /** Holds the fixture state so teardown can flush its pending writes. */
 let bridgeState
@@ -104,7 +105,7 @@ async function startMockGateway({ tools = false, reasoning = false } = {}) {
     }
     res.end()
   })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  await listenOnFetchablePort(server)
   return {
     baseURL: `http://127.0.0.1:${server.address().port}`,
     close: () => new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve) }),

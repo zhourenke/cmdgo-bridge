@@ -17,6 +17,7 @@ import { createServer } from 'node:http'
 import { deflateSync } from 'node:zlib'
 
 import { DEFAULT_IMAGE_LIMITS, fetchImage } from '../dist/image.js'
+import { listenOnFetchablePort } from './helpers/loopback-port.mjs'
 
 let CRC_TABLE
 function crc32(buf) {
@@ -70,7 +71,7 @@ const localLimits = (over = {}) => ({
 async function serve(handler) {
   const server = createServer(handler)
   server.on('clientError', () => {})
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  await listenOnFetchablePort(server)
   const { port } = server.address()
   return {
     base: `http://127.0.0.1:${port}`,

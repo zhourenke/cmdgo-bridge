@@ -19,6 +19,7 @@
  * when debugging by hand.
  */
 import { createServer } from 'node:http'
+import { listenOnFetchablePort } from './loopback-port.mjs'
 
 /** Upstream events the bridge expects on `POST /alpha/generate` (NDJSON). */
 const SCENARIOS = {
@@ -131,7 +132,7 @@ export async function startFaultUpstream(scenario = 'die-mid-stream') {
     state.requests += 1
     handler(res, (obj) => res.write(`${JSON.stringify(obj)}\n`))
   })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  await listenOnFetchablePort(server)
   // Long timeouts, and deliberately NO short `keepAliveTimeout`.
   //
   // An earlier attempt set `keepAliveTimeout = 1` to retire idle sockets quickly. That

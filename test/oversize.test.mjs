@@ -27,6 +27,7 @@ import { removeDataDir } from './helpers/teardown.mjs'
 
 import { defaultConfig } from '../dist/config.js'
 import { buildState, createBridgeServer } from '../dist/server.js'
+import { listenOnFetchablePort } from './helpers/loopback-port.mjs'
 
 /** Holds the fixture state so teardown can flush its pending writes. */
 let bridgeState
@@ -409,7 +410,7 @@ test('an oversized body does not leak an error into later requests', async () =>
 
 test('the helper server is not left listening anywhere unexpected', async () => {
   const probe = createServer()
-  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve))
+  await listenOnFetchablePort(probe)
   assert.notEqual(probe.address().port, port)
   await new Promise((resolve) => probe.close(resolve))
 })

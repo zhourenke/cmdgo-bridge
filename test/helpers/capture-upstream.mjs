@@ -10,6 +10,7 @@
  * `test/` as a test file.
  */
 import { createServer } from 'node:http'
+import { listenOnFetchablePort } from './loopback-port.mjs'
 
 /** A minimal well-formed stream so callers can also assert on the happy path. */
 const HEALTHY_EVENTS = [
@@ -65,7 +66,7 @@ export async function startCapturingUpstream(options = {}) {
     for (const event of HEALTHY_EVENTS) res.write(`${JSON.stringify(event)}\n`)
     res.end()
   })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  await listenOnFetchablePort(server)
   server.headersTimeout = 60_000
   server.requestTimeout = 60_000
   return {

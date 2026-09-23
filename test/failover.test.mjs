@@ -37,6 +37,7 @@ import { join } from 'node:path'
 
 import { defaultConfig } from '../dist/config.js'
 import { buildState, createBridgeServer } from '../dist/server.js'
+import { listenOnFetchablePort } from './helpers/loopback-port.mjs'
 
 const API_KEY = 'failover-key-0123456789abcdef'
 const realFetch = globalThis.fetch
@@ -105,7 +106,7 @@ async function startScriptedUpstream(behaviour) {
     })
     res.end()
   })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  await listenOnFetchablePort(server)
   // Same socket hygiene as the shared stubs: retire idle keep-alive sockets promptly
   // and destroy them on teardown. Each subtest below boots its own upstream on a fresh
   // port and closes it afterwards, so without this a socket cached in the test
