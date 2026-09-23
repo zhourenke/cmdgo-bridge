@@ -191,21 +191,51 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> 
   // Reject an oversized body from its declared length before buffering anything.
   const declared = Number(req.headers['content-length'])
   if (Number.isSafeInteger(declared) && declared > BODY_CAP) {
-    throw new ClientError('request body too large (max 8 MiB)', 413)
+    throw new ClientError(`request body too large (max ${BODY_CAP / 1024 / 1024} MiB)`, 413)
   }
   const chunks: Buffer[] = []
   let size = 0
   let overflow = false
+  /**
+   * Discard everything past the cap instead of buffering it.
+   *
+   * The declared-length check above only covers an honest `Content-Length`. A
+   * chunked upload (or one that under-declares) used to set an `overflow` flag
+   * and drop further chunks, but it still read to the end of a body of unbounded
+   * size before answering — one client could occupy a connection indefinitely.
+   *
+   * The bytes past the cap are still consumed, not paused. Pausing looks like
+   * the cheaper option but deadlocks: with the request stalled the client keeps
+   * filling the socket, the receive window closes, and the 413 cannot be flushed
+   * back — the client is left waiting for a response that is stuck behind its
+   * own upload. Reading and dropping uses no extra memory, lets the response
+   * out, and the connection is torn down once the 413 is on the wire (see
+   * `closeAfterOversize`).
+   */
   await new Promise<void>((resolve) => {
+    let settled = false
+    const finish = (): void => {
+      if (settled) return
+      settled = true
+      resolve()
+    }
     req.on('data', (chunk: Buffer) => {
+      if (settled) return
       size += chunk.length
-      if (!overflow && size <= BODY_CAP && chunk !== undefined) chunks.push(chunk)
-      else overflow = true
+      if (overflow) return
+      if (size > BODY_CAP) {
+        overflow = true
+        chunks.length = 0
+        finish()
+        return
+      }
+      chunks.push(chunk)
     })
-    req.on('end', () => resolve())
-    req.on('error', () => resolve())
+    req.on('end', finish)
+    req.on('error', finish)
+    req.on('close', finish)
   })
-  if (overflow) throw new ClientError('request body too large (max 8 MiB)', 413)
+  if (overflow) throw new ClientError(`request body too large (max ${BODY_CAP / 1024 / 1024} MiB)`, 413)
   if (chunks.length === 0) return {}
   const raw = Buffer.concat(chunks).toString('utf8')
   try {
@@ -376,6 +406,35 @@ export function createBridgeServer(state: BridgeState): Server {
     return { error: { message, type: 'invalid_request_error', code, param: null } }
   }
 
+  /**
+   * Sends a JSON error and stops the client from finishing the upload.
+   *
+   * `readBody` rejects as soon as it has seen enough, so for a large body the
+   * request stream is still unread when the error goes out. Without
+   * `Connection: close` the client keeps uploading a body nobody will read and
+   * the socket lingers; the header tells it to stop and drop the connection.
+   */
+  function jsonError(res: ServerResponse, status: number, body: unknown): void {
+    if (!res.headersSent) res.setHeader('Connection', 'close')
+    json(res, status, body)
+  }
+
+  /**
+   * Refuses to keep a connection whose body was rejected as oversized.
+   *
+   * The body keeps being read (see `readBody`) so the 413 can reach the client,
+   * which means an unbounded upload would otherwise hold the connection until it
+   * finished on its own. `destroySoon()` waits for the queued response bytes to
+   * flush before closing; a plain `destroy()` on `'finish'` is not equivalent —
+   * `'finish'` only means the response was handed to the socket, so destroying
+   * there discards the bytes still queued and the client sees a connection reset
+   * instead of the 413.
+   */
+  function closeAfterOversize(req: IncomingMessage, res: ServerResponse, status: number): void {
+    if (status !== 413) return
+    res.once('close', () => req.socket.destroySoon())
+  }
+
   async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     let body: Record<string, unknown>
     let chat: ChatRequest
@@ -389,7 +448,8 @@ export function createBridgeServer(state: BridgeState): Server {
     } catch (error) {
       const message = error instanceof ClientError ? error.message : 'invalid request'
       const status = error instanceof ClientError ? error.httpStatus : 400
-      json(res, status, openaiErrorBody(message, 'invalid_request_error'))
+      jsonError(res, status, openaiErrorBody(message, 'invalid_request_error'))
+      closeAfterOversize(req, res, status)
       logLine(`[cmdgo] chat 请求被拒 ${status} ${message}`)
       return
     }
@@ -729,7 +789,13 @@ export function createBridgeServer(state: BridgeState): Server {
       if (pathname.startsWith('/v1/')) {
         cors(res)
         if (!authorized(req)) {
-          json(res, 401, openaiErrorBody('无效或缺失的 API key（Authorization: Bearer <key>）', 'invalid_api_key'))
+          jsonError(res, 401, openaiErrorBody('无效或缺失的 API key（Authorization: Bearer <key>）', 'invalid_api_key'))
+          // Auth is checked before the body is read, so a rejected POST may still
+          // have megabytes in flight. Close, or the client uploads the whole
+          // thing into a request that will never be read.
+          if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+            res.once('close', () => req.socket.destroySoon())
+          }
           return
         }
         const route = pathname.replace(/\/+$/, '')
@@ -752,9 +818,12 @@ export function createBridgeServer(state: BridgeState): Server {
     } catch (error) {
       if (res.writableEnded) return
       // A client fault (oversized body, unparseable JSON) keeps its own status
-      // instead of being flattened into a 500.
+      // instead of being flattened into a 500. `readBody` may have stopped
+      // early, so the response closes the connection rather than leaving the
+      // client uploading into a request nobody will read.
       const status = error instanceof ClientError ? error.httpStatus : 500
-      json(res, status, { ok: false, error: error instanceof Error ? error.message : String(error) })
+      jsonError(res, status, { ok: false, error: error instanceof Error ? error.message : String(error) })
+      closeAfterOversize(req, res, status)
     }
   }
 
