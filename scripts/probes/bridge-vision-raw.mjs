@@ -2,8 +2,11 @@
  * Diagnostic: dump the RAW bridge response for an image request, including
  * finish_reason, reasoning_content and completion token details.
  *
+ * ⚠️ 消耗真实额度：会通过桥发起带图对话请求。确认后再执行。
+ *
  * Usage: node scripts/probes/bridge-vision-raw.mjs [--base URL] [--model M] [--max-tokens N]
  */
+import './_live-probe-guard.mjs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'

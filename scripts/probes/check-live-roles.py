@@ -3,17 +3,43 @@
 Prints the actual error body for image parts on non-user roles, and compares
 image vs text-only prompt_tokens so the image provably reaches the model.
 
-Usage: python check_live.py
+⚠️ 本探针会向真实上游发起 6 次对话请求，**消耗真实额度**，且其中一次带图片。
+   请先确认桥已在运行，并显式同意后再执行。
+
+用法:
+    # Windows PowerShell
+    $env:CMDGO_ALLOW_LIVE_PROBES = "1"
+    $env:CMDGO_KEY = "<控制台 CONFIG 区的客户端 API key>"
+    python check-live-roles.py
+
+可用环境变量:
+    CMDGO_ALLOW_LIVE_PROBES  必须为 1，否则本脚本拒绝运行（防误触）
+    CMDGO_KEY                客户端 API key（必需，无默认值）
+    CMDGO_BASE               桥的 /v1 地址，默认 http://127.0.0.1:11435/v1
+    CMDGO_MODEL              模型 id，默认 deepseek/deepseek-v4.1-flash
 """
 import json
+import os
+import sys
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:11435/v1"
-KEY = "da6f9bd0acef6fd1ced3ea08cac8b2ad9f6b7081ed65b1cb"
+if os.environ.get("CMDGO_ALLOW_LIVE_PROBES") != "1":
+    sys.exit(
+        "拒绝运行：本探针会消耗真实上游额度。\n"
+        "确认后请设置 CMDGO_ALLOW_LIVE_PROBES=1 再执行。"
+    )
+
+BASE = os.environ.get("CMDGO_BASE", "http://127.0.0.1:11435/v1")
+KEY = os.environ.get("CMDGO_KEY", "")
+if not KEY:
+    sys.exit(
+        "缺少 CMDGO_KEY：请填控制台 CONFIG 区的客户端 API key。\n"
+        "本脚本不提供默认值——历史上这里硬编码过一个真实 key（F-01）。"
+    )
 TINY = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
         "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
-MODEL = "deepseek/deepseek-v4.1-flash"
+MODEL = os.environ.get("CMDGO_MODEL", "deepseek/deepseek-v4.1-flash")
 
 
 def call(messages, max_tokens=16):

@@ -10,11 +10,14 @@
  *   4. malformed / oversized / unsupported parts fail loudly with 400;
  *   5. a remote https image URL is fetched by the bridge and read correctly.
  *
+ * ⚠️ 消耗真实额度：会通过桥发起多次带图对话请求。确认后再执行。
+ *
  * Usage:
  *   node scripts/probes/bridge-vision-e2e.mjs [--base http://127.0.0.1:11436/v1]
  *                                             [--key <client-api-key>]
  *                                             [--model deepseek/deepseek-v4.1-flash]
  */
+import './_live-probe-guard.mjs'
 import { deflateSync } from 'node:zlib'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'

@@ -7,8 +7,11 @@
  * credential, and reports (a) whether the HTTP call is accepted, (b) whether the
  * model answers the question that only the pixels can answer.
  *
- * Usage: node test/upstream-image-probe.mjs [--max-tokens N]
+ * ⚠️ 消耗真实额度：直接使用账号池凭据打真实上游。确认后再执行。
+ *
+ * Usage: node scripts/probes/upstream-image-probe.mjs [--max-tokens N]
  */
+import './_live-probe-guard.mjs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'

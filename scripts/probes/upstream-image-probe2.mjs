@@ -6,8 +6,11 @@
  * Discrimination image: a solid background plus one large black word. The word
  * cannot be guessed from the prompt, so a correct answer proves real vision.
  *
- * Usage: node test/upstream-image-probe2.mjs [--max-tokens N]
+ * ⚠️ 消耗真实额度：直接使用账号池凭据打真实上游。确认后再执行。
+ *
+ * Usage: node scripts/probes/upstream-image-probe2.mjs [--max-tokens N]
  */
+import './_live-probe-guard.mjs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
