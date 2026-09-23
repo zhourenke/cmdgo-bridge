@@ -57,6 +57,20 @@ export interface BridgeState {
   onListening?: () => void
   /** Fatal server error (e.g. EADDRINUSE); the caller decides to exit. */
   onError?: (error: NodeJS.ErrnoException) => void
+  /**
+   * Resource ceilings, overridable so tests can verify them at real time scales
+   * instead of waiting out the production timeouts.
+   */
+  limits?: Partial<ServerLimits>
+}
+
+export interface ServerLimits {
+  /** Concurrent chat completions across all accounts; see {@link MAX_CONCURRENT_CHATS}. */
+  maxConcurrentChats: number
+  /** Buffered bytes tolerated for a slow client before writes are throttled. */
+  writeBufferHighWater: number
+  /** How long a client may refuse to accept streamed bytes before being dropped. */
+  writeDrainTimeoutMs: number
 }
 
 /**
@@ -78,6 +92,32 @@ function credentialsInvalidate(credentials: CredentialsSeam): void {
 }
 
 const INDEX_FILE = join(fileURLToPath(new URL('.', import.meta.url)), '..', 'public', 'index.html')
+
+/**
+ * How many chat completions may run at once, across every account.
+ *
+ * Without a ceiling, N downstream clients means N simultaneous upstream calls:
+ * one busy agent workspace saturates the plan and every other request queues
+ * behind it at the provider, where the bridge cannot see or report the wait.
+ * 16 is comfortably above the three-person sharing this is built for while
+ * staying well inside what the Go plan tolerates. Over the limit the bridge
+ * answers 429 with `Retry-After` instead of silently piling up.
+ */
+const MAX_CONCURRENT_CHATS = 16
+
+/**
+ * How long a client may fail to accept streamed bytes before it is dropped.
+ *
+ * Once `res.write` returns false the kernel buffer is full; the client has
+ * stopped reading. Upstream keeps producing tokens, so the buffer would grow
+ * without bound (or Node would hold every chunk in memory) while the account's
+ * quota is being spent. This is the point at which that is not worth waiting
+ * for. 30s is far longer than any real client needs.
+ */
+const WRITE_DRAIN_TIMEOUT_MS = 30_000
+
+/** Bytes buffered for a slow client before writes are throttled. */
+const WRITE_BUFFER_HIGH_WATER = 1 << 20
 /**
  * 访问/聊天日志落盘：无论桥由谁启动(控制台 vs 双击脚本)都可追溯。
  * Follows the configured data directory so a `--data-dir` run does not scatter
@@ -249,9 +289,76 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> 
   }
 }
 
+/**
+ * Waits until a response's write buffer has drained.
+ *
+ * Resolves true on `'drain'`. Resolves false when the client went away or when
+ * it failed to accept bytes within `timeoutMs`, so a stalled consumer cannot pin
+ * a request open. The timeout is cleared on both paths and is unref'd, so it
+ * never keeps the process alive on its own.
+ */
+export function waitForDrain(
+  res: ServerResponse,
+  { highWater = WRITE_BUFFER_HIGH_WATER, timeoutMs = WRITE_DRAIN_TIMEOUT_MS } = {},
+): Promise<boolean> {
+  if (res.writableEnded || res.destroyed) return Promise.resolve(false)
+  if (res.writableLength <= highWater) return Promise.resolve(true)
+  return new Promise<boolean>((resolve) => {
+    let settled = false
+    const finish = (drained: boolean): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      res.off('drain', onDrain)
+      res.off('close', onClose)
+      resolve(drained)
+    }
+    const onDrain = (): void => finish(true)
+    const onClose = (): void => finish(false)
+    const timer = setTimeout(() => finish(false), timeoutMs)
+    timer.unref?.()
+    res.on('drain', onDrain)
+    res.on('close', onClose)
+  })
+}
+
 export function createBridgeServer(state: BridgeState): Server {
   const { cfg, credentials, pool, login } = state
   accessLogFile = join(state.dataDir, 'access.log')
+  const limits: ServerLimits = {
+    maxConcurrentChats: MAX_CONCURRENT_CHATS,
+    writeBufferHighWater: WRITE_BUFFER_HIGH_WATER,
+    writeDrainTimeoutMs: WRITE_DRAIN_TIMEOUT_MS,
+    ...state.limits,
+  }
+
+  /** Chat completions currently running, across every account. */
+  let chatInFlight = 0
+
+  /**
+   * Reserves a concurrency slot for one chat completion.
+   *
+   * Returns the release function, or a `GatewayError` when the bridge is at
+   * capacity. Called before any response bytes are committed so an over-capacity
+   * request can still be answered with a real status code; see
+   * {@link MAX_CONCURRENT_CHATS}.
+   */
+  function admitChat(): (() => void) | GatewayError {
+    if (chatInFlight >= limits.maxConcurrentChats) {
+      return new GatewayError(
+        `并发对话请求已达上限（${limits.maxConcurrentChats}），请稍后重试`,
+        429,
+        'rate_limit_exceeded',
+      )
+    }
+    chatInFlight += 1
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      chatInFlight -= 1
+    }
+  }
 
   // 池预热：`openGateway` 会自行等待加载完成，这里只是免去首个请求的加载
   // 延迟，并让坏清单在启动日志里尽早暴露。
@@ -469,6 +576,15 @@ export function createBridgeServer(state: BridgeState): Server {
     }
 
     if (!chat.stream) {
+      // Same ceiling as the streaming path, acquired after the pool check so a
+      // request that cannot run anyway is not counted against capacity.
+      const admitted = admitChat()
+      if (admitted instanceof GatewayError) {
+        res.setHeader('Retry-After', '2')
+        json(res, admitted.httpStatus, openaiErrorBody(admitted.message, admitted.code))
+        logOutcome(`error ${admitted.code}`, admitted.message)
+        return
+      }
       try {
         const acc = emptyAccumulator()
         let finished = false
@@ -491,6 +607,8 @@ export function createBridgeServer(state: BridgeState): Server {
           json(res, 500, openaiErrorBody(message, 'INTERNAL'))
           logOutcome('error INTERNAL', message)
         }
+      } finally {
+        admitted()
       }
       return
     }
@@ -508,6 +626,18 @@ export function createBridgeServer(state: BridgeState): Server {
       return
     }
 
+    // Capacity is checked BEFORE flushHeaders for the same reason the pool check
+    // is: once the 200 + event-stream headers are out, an overloaded bridge could
+    // only report it as an in-band error event on an apparently successful
+    // response. A 429 has to be a real status code to be actionable.
+    const admitted = admitChat()
+    if (admitted instanceof GatewayError) {
+      res.setHeader('Retry-After', '2')
+      json(res, admitted.httpStatus, openaiErrorBody(admitted.message, admitted.code))
+      logOutcome(`error ${admitted.code}`, admitted.message)
+      return
+    }
+
     res.statusCode = 200
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
     res.setHeader('Cache-Control', 'no-cache')
@@ -520,9 +650,40 @@ export function createBridgeServer(state: BridgeState): Server {
     const id = chatCompletionId()
     const created = Math.floor(Date.now() / 1000)
     const meta = { id, object: 'chat.completion.chunk', created, model: chat.model }
+    /**
+     * True once the client has stopped accepting bytes and we gave up on it.
+     * Checked by the stream loop so a dead consumer stops spending quota.
+     */
+    let clientGone = false
+    /** One drain watch at a time; see `emit`. */
+    let watchingDrain = false
+    /**
+     * Writes one SSE frame, watching for a client that has stopped reading.
+     *
+     * `res.write` was previously fire-and-forget. For a client that stops
+     * reading — a paused terminal, a sleeping laptop, a stalled proxy — every
+     * chunk accumulated in the writable buffer while upstream kept generating
+     * tokens and the plan kept being charged. A buffer past
+     * {@link WRITE_BUFFER_HIGH_WATER} starts a drain watch that gives up after
+     * {@link WRITE_DRAIN_TIMEOUT_MS}.
+     *
+     * The watch is single-flight: an upstream flood calls `emit` thousands of
+     * times, and arming a listener per call both leaks listeners and re-arms the
+     * timeout on every frame, so a slow trickle could never time out.
+     */
     const emit = (chunk: unknown): void => {
-      if (res.writableEnded) return
+      if (res.writableEnded || clientGone) return
       res.write(`data: ${JSON.stringify(chunk)}\n\n`)
+      if (watchingDrain || res.writableLength <= limits.writeBufferHighWater) return
+      watchingDrain = true
+      void waitForDrain(res, { highWater: limits.writeBufferHighWater, timeoutMs: limits.writeDrainTimeoutMs })
+        .then((drained) => {
+          watchingDrain = false
+          if (drained || clientGone) return
+          clientGone = true
+          logOutcome('client-stalled', `写缓冲超过 ${limits.writeDrainTimeoutMs}ms 未能排空，已断开`)
+          res.destroy()
+        })
     }
     const choice = (delta: unknown, finishReason: string | null) => ({
       ...meta, choices: [{ index: 0, delta, finish_reason: finishReason }],
@@ -574,9 +735,16 @@ export function createBridgeServer(state: BridgeState): Server {
     try {
       for await (const event of openGateway(chat, ctx)) {
         apply(event)
+        // A consumer that stopped reading has already been given up on; stop
+        // pulling events so the account is not charged for tokens nobody sees.
+        if (clientGone) {
+          failed = true
+          logOutcome('client-stalled', '已断开，提前终止上游读取')
+          break
+        }
         if (event.type === 'finish-step') break
       }
-      logOutcome('ok')
+      if (!failed) logOutcome('ok')
     } catch (error) {
       failed = true
       const message = error instanceof Error ? error.message : String(error)
@@ -585,9 +753,11 @@ export function createBridgeServer(state: BridgeState): Server {
           : 'INTERNAL'
       logOutcome(`error ${code}`, message)
       // 头已发出，无法改状态码：以事件形式告知客户端。
-      emit({ ...meta, choices: [], error: { message, type: code, code } })
+      if (!clientGone) emit({ ...meta, choices: [], error: { message, type: code, code } })
+    } finally {
+      admitted()
     }
-    if (!res.writableEnded) {
+    if (!res.writableEnded && !clientGone) {
       if (failed) {
         // 失败流只发错误事件。补一个 finish_reason 或 usage 会把截断伪装成
         // 正常结束：全 0 的 usage 在下游账本里与「成功且免费」无法区分，
@@ -783,6 +953,11 @@ export function createBridgeServer(state: BridgeState): Server {
           accounts: snapshot.accounts.length,
           activeAccounts: snapshot.activeAccounts,
           models: snapshot.modelCount,
+          // Capacity is reported so an operator (and the tests) can see whether
+          // requests are being turned away by the concurrency ceiling rather than
+          // by the plan or the accounts.
+          chatInFlight,
+          chatCapacity: limits.maxConcurrentChats,
         })
         return
       }
@@ -879,7 +1054,7 @@ export function createBridgeServer(state: BridgeState): Server {
   return server
 }
 
-export function buildState(cfg: ServerConfig, dataDir: string): BridgeState {
+export function buildState(cfg: ServerConfig, dataDir: string, limits?: Partial<ServerLimits>): BridgeState {
   const log = (m: string): void => console.log(`[cmdgo] ${m}`)
   const credentials = new FileCredentials(dataDir, log)
   return {
@@ -888,5 +1063,6 @@ export function buildState(cfg: ServerConfig, dataDir: string): BridgeState {
     credentials,
     pool: new AccountPool({ baseRef: 'COMMANDCODE_API_KEY', dataDir, log }),
     login: new CommandCodeLoginManager(log),
+    ...(limits === undefined ? {} : { limits }),
   }
 }

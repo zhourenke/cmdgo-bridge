@@ -12,6 +12,7 @@ Command Code 的订阅分两种:标准 Provider API(OpenAI 兼容,任何工具�
 - **图片输入(多模态)**:`image_url` 支持内联 `data:` URL 与远程 `http(s)` 地址,落地为上游 `{ type:'image', source:{ type:'base64', … } }` 信封;模型确实能读像素(见下文「图片输入」)
 - **OAuth 登录**:控制台一键生成登录地址,浏览器授权后 API key 自动回收入池,免手动复制
 - **多账号池**:每完成一次登录新 key 自动成为独立账号,请求级 round-robin 摊薄额度;失败(401/403/429/5xx/网络错误)自动指数冷却并故障转移,绝不重放半截回答
+- **并发上限与背压**:全局最多 16 个对话请求同时在跑,超出直接返回 `429` + `Retry-After`(而不是在上游排队);客户端停止读取时按写缓冲水位断开,不让上游额度白白消耗(见下文「并发与背压」)
 - **模型目录同步**:自动从官方目录拉取 Go 套餐可用模型(含 reasoning effort 元数据),15 分钟刷新
 - **自带 Web 控制台**:登录、凭据、账号池、模型列表一目了然,零配置上手
 - **零依赖桥**:无需 DSH / 任何框架,Node ≥ 20 即可运行,数据落盘在用户目录
@@ -128,7 +129,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | --- | --- | --- |
 | `GET /v1/models` | Bearer | 模型列表(含 `context_length` 上下文容量) |
 | `POST /v1/chat/completions` | Bearer | 对话补全(流式 / 非流式) |
-| `GET /health` | 无 | 健康检查(不含任何凭据) |
+| `GET /health` | 无 | 健康检查(不含任何凭据;含 `chatInFlight` / `chatCapacity`) |
 | `GET /` | 无 | 控制台页面 |
 | `GET /api/status` | 无鉴权 | 登录 / 账号 / 模型状态快照;**仅回环来源**的响应包含 `apiKey` |
 | `POST /api/login` `cancel` `logout` | 无鉴权 | 登录生命周期 |
@@ -171,8 +172,27 @@ curl.exe -s -o NUL -w "new=%{http_code}`n" -H "Authorization: Bearer <新token>"
 >
 > 手改文件用无 BOM 的 UTF-8 最稳妥，但**带 BOM 也不会再出问题**：三个状态文件（`config.json` / `credentials.json` / `accounts.json`）现在都会先剥掉 UTF-8 BOM 再解析。此前 BOM 会让 `config.json` 被判定为损坏并**静默重新随机生成**一个 key（所有下游 401，且日志不说明原因），也会让 `accounts.json` / `credentials.json` 读成"空"，进而被下一次写入覆盖掉——这也是控制台「轮换」按钮存在的原因。
 
-## 图片输入
+## 并发与背压
 
+3 人共享时最容易踩的不是额度，而是**并发**：一个 Agent 工作区同时开多个会话，就会在桥这一侧变成同数量的上游并发请求，其他人全排在它们后面，而且排队发生在供应商那边——桥看不到，也没法告诉你。
+
+- **全局并发上限 16**（含流式与非流式，跨所有账号）。超出的请求**不会**排队，而是立刻拿到：
+
+  ```http
+  HTTP/1.1 429 Too Many Requests
+  Retry-After: 2
+
+  {"error":{"message":"并发对话请求已达上限（16），请稍后重试","type":"invalid_request_error","code":"rate_limit_exceeded","param":null}}
+  ```
+
+  这是**真的状态码**，不是 SSE 里的事件——流式路径一旦发出响应头，状态码就冻结在 200，任何"超载"都只能伪装成一次成功的回答，客户端无从分辨。所以容量检查发生在提交响应头**之前**。
+  上限的余量按 3 人共享留得很宽（16 远高于实际需要），但足以防止单个失控客户端占满全部额度。想看当前占用：`GET /health` 的 `chatInFlight` / `chatCapacity`。
+
+- **背压**：客户端停止读取（终端暂停、笔记本休眠、中间代理卡住）时，上游仍在生成 token、额度仍在扣。桥现在跟踪响应写缓冲，超过 1 MiB 就开始等 `'drain'`，若 **30 秒**仍无法排出就断开该连接并停止读取上游，日志记录 `client-stalled`。
+
+> 调参：这两个上限目前是代码常量（`src/server.ts` 的 `MAX_CONCURRENT_CHATS` / `WRITE_BUFFER_HIGH_WATER` / `WRITE_DRAIN_TIMEOUT_MS`），没有做成 `config.json` 项——按 D-2 的三人非商业共享范围，固定值足够且少一个误配点。需要调整时改常量重新构建即可（`buildState()` 也接受 `limits` 覆盖，测试用的就是这条路径）。
+
+## 图片输入
 `messages[].content` 里的 `image_url` 部分会被转换成上游网关接受的信封:
 
 ```jsonc

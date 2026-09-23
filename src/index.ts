@@ -64,14 +64,19 @@ http://127.0.0.1:<port>/ 使用控制台完成 OAuth 登录。`)
   // loudly: the admin surface carries no token, and `/api/status` hands out the
   // only credential `/v1/*` accepts.
   if (!isLoopbackHost(cfg.host)) {
-    console.warn('')
-    console.warn('  ⚠️  警告：监听地址不是回环地址（当前 ' + cfg.host + '）')
-    console.warn('     · 管理面（/api/*、/health、控制台页面）没有鉴权，网络内任何客户端都能访问')
-    console.warn('     · 其中 GET /api/status 会返回客户端 API key，POST /api/logout 会清空账号池')
-    console.warn('     · 该地址已写入 config.json，重启后依然生效')
-    console.warn('     · 仅本机使用请改回 127.0.0.1：node dist/index.js --host 127.0.0.1')
-    console.warn('     · 确需局域网共享：请在前面加带鉴权的反向代理，并把 /api/* 限制为回环来源')
-    console.warn('')
+    // One `console.warn` call, not seven: separate calls can interleave with
+    // stdout when the two streams are captured independently, which scrambles
+    // the block and hides which line belongs to which warning.
+    console.warn([
+      '',
+      '  ⚠️  警告：监听地址不是回环地址（当前 ' + cfg.host + '）',
+      '     · 管理面（/api/*、/health、控制台页面）没有鉴权，网络内任何客户端都能访问',
+      '     · 其中 GET /api/status 会返回客户端 API key，POST /api/logout 会清空账号池',
+      '     · 该地址已写入 config.json，重启后依然生效',
+      '     · 仅本机使用请改回 127.0.0.1：node dist/index.js --host 127.0.0.1',
+      '     · 确需局域网共享：请在前面加带鉴权的反向代理，并把 /api/* 限制为回环来源',
+      '',
+    ].join('\n'))
   }
 
   const state = buildState(cfg, store.dataDir)
