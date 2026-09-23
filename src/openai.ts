@@ -473,9 +473,33 @@ export interface Accumulator {
    * The halves are summed only at serialization — see {@link usageObject}.
    */
   uncachedInputTokens: number
-  completionTokens: number
+  /** Upstream's own `outputTokens`, or undefined when it did not report one. */
+  reportedCompletionTokens?: number
+  /** Visible-answer tokens (`outputTokenDetails.textTokens`). */
+  textTokens: number
   cacheReadTokens: number
   reasoningTokens: number
+}
+
+/**
+ * Completion token count for the OpenAI wire.
+ *
+ * The gateway reports the visible answer (`textTokens`) and the hidden reasoning
+ * (`reasoningTokens`) as separate counters, and sometimes reports `outputTokens`
+ * as well. The OpenAI contract is that `completion_tokens_details` describes a
+ * SUBSET of `completion_tokens`, and several widely used tokenizers derive the
+ * visible tokens by subtracting the reasoning count from the total. Reporting
+ * upstream's `outputTokens` verbatim — which appears to count only the visible
+ * answer, or to omit a trailing reasoning block — put `reasoning_tokens` ABOVE
+ * `completion_tokens`, so those consumers clamped the visible count to zero and
+ * derived no usage at all.
+ *
+ * So: trust the explicit total when it is at least the sum of the parts, use the
+ * sum when it is larger, and never let the total fall below `reasoning_tokens`.
+ */
+export function completionTokensOf(acc: Pick<Accumulator, 'reportedCompletionTokens' | 'textTokens' | 'reasoningTokens'>): number {
+  const parts = acc.textTokens + acc.reasoningTokens
+  return Math.max(acc.reportedCompletionTokens ?? 0, parts)
 }
 
 export function emptyAccumulator(): Accumulator {
@@ -485,7 +509,8 @@ export function emptyAccumulator(): Accumulator {
     toolCalls: [],
     finishReason: null,
     uncachedInputTokens: 0,
-    completionTokens: 0,
+    reportedCompletionTokens: undefined,
+    textTokens: 0,
     cacheReadTokens: 0,
     reasoningTokens: 0,
   }
@@ -530,7 +555,8 @@ export function applyEvent(acc: Accumulator, event: CcStreamEvent): void {
           ? Math.max(0, totalInput - cacheRead)
           : totalInput) ?? 0
         acc.cacheReadTokens = cacheRead ?? 0
-        acc.completionTokens = optionalNumber(usage.outputTokens) ?? optionalNumber(outputDetails?.textTokens) ?? 0
+        acc.reportedCompletionTokens = optionalNumber(usage.outputTokens)
+        acc.textTokens = optionalNumber(outputDetails?.textTokens) ?? 0
         acc.reasoningTokens = optionalNumber(outputDetails?.reasoningTokens) ?? 0
       }
       break
@@ -583,12 +609,16 @@ export function chatCompletionId(): string {
  */
 export function usageObject(acc: Accumulator): unknown {
   const promptTokens = acc.uncachedInputTokens + acc.cacheReadTokens
+  const completionTokens = completionTokensOf(acc)
+  // Reasoning is reported as a detail of the completion total, so it must be
+  // clamped to it as well; a detail larger than its parent is invalid wire data.
+  const reasoningTokens = Math.min(acc.reasoningTokens, completionTokens)
   return {
     prompt_tokens: promptTokens,
-    completion_tokens: acc.completionTokens,
-    total_tokens: promptTokens + acc.completionTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
     prompt_tokens_details: { cached_tokens: acc.cacheReadTokens },
-    completion_tokens_details: { reasoning_tokens: acc.reasoningTokens },
+    completion_tokens_details: { reasoning_tokens: reasoningTokens },
   }
 }
 
