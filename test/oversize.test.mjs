@@ -50,6 +50,19 @@ before(async () => {
   globalThis.fetch = stubCatalog
   const cfg = { ...defaultConfig(), host: '0.0.0.0', port: 0, apiKey: API_KEY }
   server = createBridgeServer((bridgeState = buildState(cfg, dataDir)))
+  // This file makes clients abort mid-body on purpose (that is the 413 behaviour under
+  // test). A peer that disappears while the server still holds unread body bytes makes
+  // the kernel answer with RST, and the server's socket then sees an error that has no
+  // listener — node:test attributes it to whichever test is running and fails the file
+  // with a bare `read ECONNRESET`, even when every assertion passed. Draining and
+  // absorbing those resets is standard server hygiene, and it keeps the failure
+  // meaningful: a real regression still has to fail an assertion.
+  server.on('clientError', (_error, socket) => {
+    socket.destroy()
+  })
+  server.on('connection', (socket) => {
+    socket.on('error', () => {})
+  })
   await new Promise((resolve) => server.once('listening', resolve))
   port = server.address().port
 })
@@ -93,11 +106,18 @@ function chunkedUpload(path, { auth = true, extraBytes = 64 * 1024 } = {}) {
     const done = (value) => {
       if (settled) return
       settled = true
-      // The body was deliberately never finished. Leaving the request open keeps
-      // a socket (and its queued bytes) alive past the test, which stops the
-      // test runner from exiting, so retire it now that the answer has arrived.
-      req.destroy()
       resolve(value)
+    }
+    /** Retires the socket, but only once the server is finished with it. */
+    const retire = () => {
+      if (req.destroyed) return
+      // Aborting while the server is still writing its 413 makes the server see an
+      // abortive close, and the resulting `ECONNRESET` then lands a tick later — after
+      // this test resolved — where node:test attributes it to the test that just
+      // finished and fails the FILE even though every assertion passed. So the socket
+      // is only destroyed after the response has been fully received (`res` end/close)
+      // or the server has already closed its side.
+      req.destroy()
     }
     const req = request({
       host: '127.0.0.1',
@@ -111,37 +131,68 @@ function chunkedUpload(path, { auth = true, extraBytes = 64 * 1024 } = {}) {
       },
     }, (res) => {
       stopped = true
+      // The response must have an error listener from the moment it exists. A 413
+      // makes the server stop reading and reset, and that reset can arrive while the
+      // upload loop is still writing; with no listener on `res` it surfaces as an
+      // unhandled socket error that node:test attributes to the running test, failing
+      // it with a bare `read ECONNRESET` even when every assertion passed.
+      res.on('error', () => {})
       const chunks = []
       let received = 0
       const expected = Number(res.headers['content-length'])
-      const finish = () => done({
+      const value = (finished) => ({
         status: res.statusCode,
         headers: res.headers,
         body: Buffer.concat(chunks).toString('utf8'),
-        finished: true,
+        finished,
         sent,
       })
+      const finish = () => {
+        // The answer is fully in hand; now the half-sent body can be abandoned.
+        res.once('close', retire)
+        if (res.complete || res.readableEnded) retire()
+        else res.once('end', retire)
+        done(value(true))
+      }
       res.on('data', (chunk) => {
         chunks.push(chunk)
         received += chunk.length
         if (Number.isSafeInteger(expected) && received >= expected) finish()
       })
       res.on('end', finish)
-      res.on('aborted', () => done({
-        status: res.statusCode,
-        headers: res.headers,
-        body: Buffer.concat(chunks).toString('utf8'),
-        finished: received > 0 && Number.isSafeInteger(expected) && received >= expected,
-        sent,
-      }))
+      res.on('aborted', () => {
+        retire()
+        done(value(received > 0 && Number.isSafeInteger(expected) && received >= expected))
+      })
+      // Last resort: if the reset wins the race, record what arrived rather than
+      // letting it surface as an unhandled error on a test that already passed.
+      res.on('error', () => {
+        retire()
+        done(value(false))
+      })
     })
     req.on('error', (error) => {
-      // Ignore errors that arrive after the answer did. `done()` destroys the
-      // request to retire a socket whose body was deliberately never finished, and
-      // destroying it can surface as `ECONNRESET` a tick later — an artifact of
-      // this client's own teardown, not a failure of the code under test. Letting
-      // it reject turns a green run red at random.
-      if (!settled) reject(error)
+      // Ignore errors that arrive after the answer did. `done()` retires a socket
+      // whose body was deliberately never finished, and that can surface as
+      // `ECONNRESET` a tick later — an artifact of this client's own teardown, not a
+      // failure of the code under test. Letting it reject turns a green run red at
+      // random.
+      if (!settled) {
+        // Not the teardown race: the upload died before the answer arrived. Attach the
+        // phase so a report says WHERE it broke instead of a bare socket code.
+        error.message = `${error.message} (phase=request-error sent=${sent} stopped=${stopped})`
+        reject(error)
+      }
+    })
+    // The SOCKET needs its own listener, and this is the one that actually mattered.
+    // Abandoning a request whose body was never finished leaves unread bytes on the
+    // wire; the peer answers with RST, and the resulting `ECONNRESET` arrives on the
+    // socket rather than on the request or response object. With no listener there it
+    // escapes as an unhandled error, and node:test blames whichever test is running —
+    // reported as a bare `read ECONNRESET` with no assertion attached, which is why
+    // this looked like a mystery rather than a missing listener.
+    req.once('socket', (socket) => {
+      socket.on('error', () => {})
     })
 
     const head = Buffer.from('{"model":"m","messages":[],"padding":"', 'utf8')
@@ -193,6 +244,14 @@ function declaredOversize(path) {
       // 413, so `close` can win the race. Whichever lands first resolves.
       res.on('end', () => finish(value()))
       res.on('close', () => finish(value()))
+      // A 413 closes the connection while request bytes are still queued, and the
+      // client tears the request down as soon as the answer arrives. The resulting
+      // `ECONNRESET` therefore lands on the RESPONSE object a tick later, after the
+      // promise has already resolved — and with no listener it becomes an unhandled
+      // error that fails the whole file (reported as a bare `read ECONNRESET`, with no
+      // assertion attached, which is why this looked like a socket-level mystery).
+      // The answer was already captured; the reset is the behaviour under test.
+      res.on('error', () => finish(value()))
     })
     req.on('error', (error) => {
       // The 413 closes the connection mid-body, so a late ECONNRESET here is the
@@ -201,6 +260,12 @@ function declaredOversize(path) {
         settled = true
         reject(error)
       }
+    })
+    // The reset for an abandoned body arrives on the SOCKET, not on the request or the
+    // response; without a listener there it escapes as an unhandled error and
+    // node:test blames whichever test happens to be running. See `chunkedUpload`.
+    req.once('socket', (socket) => {
+      socket.on('error', () => {})
     })
     req.end()
   })

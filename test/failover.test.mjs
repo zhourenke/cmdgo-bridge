@@ -28,6 +28,10 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { request } from 'node:http'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+// This file destroys a request after the answer arrived (the upstream dies mid-stream),
+// so a late socket reset is expected rather than a failure. See the module for the
+// narrow set of codes tolerated — real errors still fail loudly.
+import './helpers/tolerate-socket-errors.mjs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -102,10 +106,23 @@ async function startScriptedUpstream(behaviour) {
     res.end()
   })
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  // Same socket hygiene as the shared stubs: retire idle keep-alive sockets promptly
+  // and destroy them on teardown. Each subtest below boots its own upstream on a fresh
+  // port and closes it afterwards, so without this a socket cached in the test
+  // process's fetch pool can be handed to the next subtest after its server is gone —
+  // surfacing as `fetch failed` inside the bridge and failing an assertion about
+  // failover behaviour rather than about sockets.
+  server.keepAliveTimeout = 1
+  server.headersTimeout = 60_000
+  server.requestTimeout = 60_000
   return {
     baseURL: `http://127.0.0.1:${server.address().port}`,
     get keys() { return [...calls] },
-    close: () => new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve) }),
+    close: () => new Promise((resolve) => {
+      server.closeIdleConnections?.()
+      server.closeAllConnections?.()
+      server.close(resolve)
+    }),
   }
 }
 

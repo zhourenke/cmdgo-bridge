@@ -132,25 +132,32 @@ export async function startFaultUpstream(scenario = 'die-mid-stream') {
     handler(res, (obj) => res.write(`${JSON.stringify(obj)}\n`))
   })
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
-  // Retire idle keep-alive sockets the moment a response finishes.
+  // Long timeouts, and deliberately NO short `keepAliveTimeout`.
   //
-  // A stub lives for one test and is then closed. A socket the client's pool keeps
-  // cached afterwards points at a server that no longer exists, and the NEXT test's
-  // request can be handed that dead socket — surfacing as an intermittent
-  // `fetch failed` inside the bridge, blamed on the bridge. The pool belongs to the
-  // test process and cannot be cleared from here, so the sockets are retired
-  // instead. `Connection: close` would do that too, but it also changes what a
-  // mid-stream destroy looks like: the FIN turns the truncation into a clean EOF
-  // and `die-mid-stream` stops being a failure at all. A 1 ms keep-alive timeout
-  // leaves the teardown semantics alone.
-  server.keepAliveTimeout = 1
+  // An earlier attempt set `keepAliveTimeout = 1` to retire idle sockets quickly. That
+  // is what CAUSED the flake rather than fixing it: the server closes the socket, but
+  // the test process's shared fetch pool may not have processed the close event before
+  // the next test issues its request, so the pool hands out a socket that is already
+  // gone. The failure appears INSIDE the bridge as `fetch failed` / `ECONNRESET`, in a
+  // different test each time — including tests that never touch a fault scenario.
+  //
+  // Socket hygiene belongs in `close()`, where the destroy is causally tied to this
+  // stub's own teardown: see the `closeIdleConnections()` call at the bottom.
   server.headersTimeout = 60_000
   server.requestTimeout = 60_000
   const { port } = server.address()
   return {
     baseURL: `http://127.0.0.1:${port}`,
     get requests() { return state.requests },
-    close: () => new Promise((resolve) => server.close(resolve)),
+    close: () => new Promise((resolve) => {
+      // Destroy idle sockets before closing the listener — see the longer note in
+      // capture-upstream.mjs. A socket left idle in the test process's shared fetch
+      // pool can be handed to the next test after this server is gone, which surfaces
+      // as a transport failure inside the bridge.
+      server.closeIdleConnections?.()
+      server.closeAllConnections?.()
+      server.close(resolve)
+    }),
   }
 }
 

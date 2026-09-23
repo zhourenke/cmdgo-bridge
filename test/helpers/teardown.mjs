@@ -22,6 +22,10 @@
  */
 
 import { rm } from 'node:fs/promises'
+// Registers a narrow socket-error tolerance. Imported here so every file that uses the
+// shared teardown is covered without a per-file opt-in; see the module for why the
+// suite provokes these errors on purpose and what is deliberately NOT tolerated.
+import './tolerate-socket-errors.mjs'
 
 /** Removes a temp data directory without racing the pool's pending writes. */
 export async function removeDataDir(dataDir, { pool } = {}) {

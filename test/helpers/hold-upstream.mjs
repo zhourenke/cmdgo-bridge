@@ -100,6 +100,11 @@ export async function startHoldingUpstream({ mode = 'hold', deltaBytes = 512, fl
     close: () => new Promise((resolve, reject) => {
       for (const [, res] of held) res.destroy()
       held.clear()
+      // Destroy idle sockets before closing the listener — see the longer note in
+      // capture-upstream.mjs. A socket left idle in the test process's shared fetch
+      // pool can be handed to the next test after this server is gone, which surfaces
+      // as a transport failure inside the bridge.
+      server.closeIdleConnections?.()
       server.close((error) => (error === undefined || error === null ? resolve() : reject(error)))
       // Sockets held open by a paused client would delay close(); the responses
       // above are destroyed, so this settles promptly.
