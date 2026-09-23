@@ -7,4 +7,3 @@ if not exist "dist\index.js" (
 )
 echo Starting cmdgo-bridge ... keep this window open; closing it stops the service.
 node dist\index.js
-pause

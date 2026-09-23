@@ -236,13 +236,14 @@
             <button class="btn btn-sm" data-copy="cfgApiKey" id="btnKeyCopy">复制</button>
             <button class="btn btn-sm" id="btnKeyRotate">轮换</button>
           </div>
-          <!-- 必须跨满两列：.kv 是 grid(auto 1fr)，提示行若作为普通网格项会占住第 1 列，
-               把该列按整句宽度撑开，右侧装输入框和三个按钮的第 2 列就被挤到放不下，
-               按钮随之竖排并溢出卡片。文案保持纯文本、不加 <b>/<code>：body 的 sans-serif
-               与页面等宽字体（ui-monospace/Menlo/Consolas）各自成体系，行内混入 <code>
-               会落到浏览器默认的 Courier，与「尚未发起登录。」等提示行看起来不一致。
-               字号 12.5px 与 .status-line 对齐。 -->
-          <div class="hint" style="grid-column: 1 / -1; font-size: 12.5px">轮换后旧客户端 API key 立即失效，无需重启。</div>
+          <!-- 说明行显式放在第 2 列：该列起点就是 API KEY 输入框的左边框，箭头因此与之对齐。
+               它只占第 2 列，不参与第 1 列的 auto 宽度计算，所以不会像之前那样把该列撑开、
+               挤垮右侧的输入框和三个按钮。箭头复用 .status-line 的 <.m> 标记与 .idle 配色，
+               字体与「> 尚未发起登录。」一致；正文保持纯文本，不加 <b>/<code>，否则会退回
+               浏览器默认的 Courier/粗体，与相邻提示行看起来不是一种字。 -->
+          <div class="status-line idle" style="grid-column: 2; margin-top: 0">
+            <span class="m">&gt;</span><span>轮换后旧客户端 API key 立即失效，无需重启。</span>
+          </div>
           <span class="k">KEY REF</span>
           <div class="kv-row"><span class="v" id="cfgRef"></span></div>
         </div>

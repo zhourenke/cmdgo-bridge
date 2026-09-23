@@ -190,24 +190,31 @@ test('the console exposes a rotate control', async () => {
   assert.ok(page.body.includes('立即失效'), 'and must warn that the old token dies immediately')
 })
 
-test('the rotation hint stays a full-width grid row rendered as plain text', async () => {
+test('the rotation note sits in column 2, styled like the other status lines', async () => {
   const page = await call('/')
-  const hint = page.body.match(/<div class="hint"[^>]*>[^<]*轮换后[^<]*<\/div>/)
-  assert.ok(hint, 'the CONFIG section must carry the rotation hint')
+  const note = page.body.match(
+    /<div class="status-line idle"[^>]*>\s*<span class="m">&gt;<\/span><span>[^<]*轮换后[^<]*<\/span>\s*<\/div>/)
+  assert.ok(note, 'the CONFIG section must carry the rotation note')
 
-  // `.kv` is `display:grid; grid-template-columns:auto 1fr`. A hint that participates as an
-  // ordinary grid item lands in column 1, widens that `auto` column to the full sentence, and
-  // starves column 2 (the API-key field plus its three buttons) until they wrap out of the
-  // card. Spanning both columns is what keeps the row intact — this has regressed once.
-  assert.match(hint[0], /grid-column:\s*1\s*\/\s*-1/,
-    'the hint must span both .kv columns or it crushes the API-key row')
+  // `.kv` is `grid-template-columns: auto 1fr`. Column 2 starts exactly at the API-key field's
+  // left border, so placing the note there lines its ">" up with that border. It is also what
+  // keeps the note out of column 1: an auto-placed item would land in that `auto` column, widen
+  // it to the full sentence, and squeeze the field plus its three buttons out of the card —
+  // which is the regression this guards (the earlier `hint` had no placement at all).
+  assert.match(note[0], /grid-column:\s*2\b/,
+    'the note must be placed in column 2 for alignment, and to keep column 1 narrow')
+
+  // Reusing the status-line classes is what makes the ">" the same glyph as in
+  // "> 尚未发起登录。" rather than a lookalike.
+  assert.match(note[0], /class="status-line idle"/,
+    'the note must reuse the status-line markup so its ">" matches the other status lines')
 
   // Typography: the page's sans-serif body and its monospace stack are separate systems, so a
   // bare <code>/<b> inside a body-text line renders in the browser's default Courier/bold and
   // stops matching the neighbouring status line. Keep this line plain text.
-  assert.doesNotMatch(hint[0], /<(b|code)>/,
-    'keep the hint plain text so it matches the other status lines')
+  assert.doesNotMatch(note[0], /<(b|code)>/,
+    'keep the note plain text so it matches the other status lines')
 
-  assert.match(hint[0], /无需重启/,
+  assert.match(note[0], /无需重启/,
     'and it must carry the current wording, which says no restart is needed')
 })
