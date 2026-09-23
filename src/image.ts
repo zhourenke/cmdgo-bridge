@@ -163,6 +163,20 @@ function finalize(
 /* ---------------- data: URLs ---------------- */
 
 /**
+ * Base64 character -> 6-bit value, indexed by char code; `-1` for everything else.
+ *
+ * Used only to check the unused bits of an unpadded final character. `Buffer`'s
+ * decoder ignores those bits, so `AAAB` and `AAAA` decode to the same bytes and
+ * a caller who corrupted one character would never hear about it.
+ */
+const B64_INDEX: number[] = (() => {
+  const table = new Array<number>(128).fill(-1)
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  for (let i = 0; i < alphabet.length; i++) table[alphabet.charCodeAt(i)] = i
+  return table
+})()
+
+/**
  * Split `data:<mediatype>[;params],<payload>`.
  *
  * Hand-parsed rather than matched with a regex: the parameters section may hold
@@ -195,12 +209,43 @@ export function parseDataUrl(url: string, limits: ImageLimits): ImagePart {
       `data: URL image is about ${declaredBytes} bytes, over the ${limits.maxBytes}-byte limit`,
     )
   }
-  let bytes: Buffer
-  try {
-    bytes = Buffer.from(payload, 'base64')
-  } catch {
-    throw new ImageError('data: URL payload is not valid base64')
+  // Validate the payload BEFORE handing it to the decoder.
+  //
+  // `Buffer.from(payload, 'base64')` never throws: Node silently DROPS every
+  // character outside the base64 alphabet. The `catch` that used to wrap it was
+  // therefore dead code, and the comment claiming it rejected invalid base64 was
+  // wrong. The input was still safe — garbage decodes to garbage bytes, which the
+  // magic-number sniff then refuses — but it was refused as "unrecognized image
+  // format", sending whoever pasted a truncated or URL-encoded blob looking for a
+  // format problem that did not exist.
+  const normalized = payload.replace(/\s+/g, '')
+  let invalid: string | undefined
+  if (normalized.length === 0) {
+    invalid = 'payload is empty'
+  } else if ((normalized.match(/=/g) ?? []).length > 2) {
+    invalid = 'more than two padding characters'
+  } else if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized)) {
+    invalid = 'invalid character outside A-Za-z0-9+/ (or padding in the middle)'
+  } else {
+    // A single leftover character cannot encode a byte in any base64 framing.
+    const quantum = normalized.length % 4
+    if (quantum === 1) invalid = 'truncated final quantum (length leaves one dangling character)'
+    // When the length is not a multiple of 4 the input is unpadded, which many
+    // encoders emit and every decoder accepts — but only when the unused bits of
+    // the final character are zero. `AAAA` padded is canonical; `AAAB` claims bits
+    // that no byte can carry, and Node would silently decode it as if they were 0.
+    else if (quantum === 2 && (B64_INDEX[normalized.charCodeAt(normalized.length - 1)] ?? 0) % 16 !== 0) {
+      invalid = 'non-canonical trailing bits (last character carries data beyond the final byte)'
+    } else if (quantum === 3 && (B64_INDEX[normalized.charCodeAt(normalized.length - 1)] ?? 0) % 4 !== 0) {
+      invalid = 'non-canonical trailing bits (last character carries data beyond the final byte)'
+    }
   }
+  if (invalid !== undefined) {
+    throw new ImageError(`data: URL payload is not valid base64 (${invalid})`)
+  }
+  // Decode the NORMALIZED string: the declared-size check above measured the raw
+  // payload, and whitespace would otherwise count toward the decoded length.
+  const bytes = Buffer.from(normalized, 'base64')
   return finalize(bytes, declared, limits, 'data: URL')
 }
 

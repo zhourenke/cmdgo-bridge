@@ -246,6 +246,15 @@ curl.exe -s -o NUL -w "new=%{http_code}`n" -H "Authorization: Bearer <新token>"
 - 别名 `input_image` 同样接受;`input_audio` / `input_file` / `video` 等明确返回 400(而不是静默丢弃,避免误以为已转写)
 - 图片体积超限、格式非法、数量超过 `images.maxPerRequest` 时返回 400,报文说明具体原因
 
+**base64 校验**:`data:` URL 的 payload 会**先按 base64 校验再解码**,两类失败分得很清:
+
+- `data: URL payload is not valid base64 (…)` —— 编码本身有问题:字母表之外的字符、长度对 4 取余为 1(末尾挂着半个字节)、超过两个 `=`、`=` 出现在中间、未填充但末尾字符带有多余位。括号里会说明具体是哪一种。
+- `data: URL: unrecognized image format (expected png/jpeg/gif/webp)` —— 编码合法,但解出来的字节不是支持的图片。
+
+这两条以前是混在一起的:Node 的 `Buffer.from(x,'base64')` **从不抛错**,它只是静默丢弃字母表之外的字符,所以原来那句"拒绝非法 base64"的 `catch` 是**死代码**,任何畸形输入都会被解码成垃圾字节、再由魔数嗅探以"unrecognized image format"拒掉——把排查方向带偏到格式问题上。行为本身一直是安全的(非法字符只会让解出的字节**更少**,不可能放大),改的是可诊断性。
+
+两点宽容性保持不变:payload 里的**空白符会被先剥掉**(MIME 换行是合法 base64);**未填充**(无 `=`)的规范编码照常接受。
+
 **缓存复用**:上游的 prompt cache 是**前缀缓存**,因此实现上刻意保证——不含图片的消息仍序列化为原来的纯字符串 `content`,与加入图片功能之前的信封逐字节一致;同一张图片的 base64 编码是确定性的(不重新编码)。所以纯文本会话不会因为本功能丢掉任何缓存,而带图会话只要图片字节不变,重复请求也能命中前缀缓存。
 
 **注意**:推理型模型的 `max_tokens` 会被思维链先消耗。带图请求若把 `max_tokens` 设得过小(例如 200),可能只输出空内容——此时 `usage.completion_tokens_details.reasoning_tokens` 已接近上限,把预算放宽即可,并非图片没被读到。

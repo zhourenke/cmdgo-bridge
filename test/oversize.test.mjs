@@ -136,6 +136,11 @@ function chunkedUpload(path, { auth = true, extraBytes = 64 * 1024 } = {}) {
       }))
     })
     req.on('error', (error) => {
+      // Ignore errors that arrive after the answer did. `done()` destroys the
+      // request to retire a socket whose body was deliberately never finished, and
+      // destroying it can surface as `ECONNRESET` a tick later — an artifact of
+      // this client's own teardown, not a failure of the code under test. Letting
+      // it reject turns a green run red at random.
       if (!settled) reject(error)
     })
 
@@ -161,6 +166,12 @@ function chunkedUpload(path, { auth = true, extraBytes = 64 * 1024 } = {}) {
 /** A declared Content-Length above the cap: rejected before any body is read. */
 function declaredOversize(path) {
   return new Promise((resolve, reject) => {
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
     const req = request({
       host: '127.0.0.1',
       port,
@@ -176,11 +187,21 @@ function declaredOversize(path) {
       },
     }, (res) => {
       const chunks = []
+      const value = () => ({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') })
       res.on('data', (chunk) => chunks.push(chunk))
-      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
-      res.on('close', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+      // Either event may arrive first; the server sends `Connection: close` for a
+      // 413, so `close` can win the race. Whichever lands first resolves.
+      res.on('end', () => finish(value()))
+      res.on('close', () => finish(value()))
     })
-    req.on('error', reject)
+    req.on('error', (error) => {
+      // The 413 closes the connection mid-body, so a late ECONNRESET here is the
+      // expected consequence of the behaviour under test, not a failure.
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    })
     req.end()
   })
 }
