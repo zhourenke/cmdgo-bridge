@@ -18,7 +18,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { readdir, readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { HIGHEST_BLOCKED_PORT, listenOnFetchablePort } from './helpers/loopback-port.mjs'
 
@@ -78,7 +79,9 @@ test('no fixture lets the OS choose a port for a server the bridge will fetch', 
   // The regression guard. `listen` with port 0 is the shape that produced the flake; it is
   // also the shape a new fixture is most likely to copy, because it is the idiomatic way to
   // get a free port. Anything that binds must go through the helper.
-  const dir = join(process.cwd(), 'test')
+  // Derived from this file's own location rather than `process.cwd()`, so the scan always
+  // covers the same files no matter where the runner was started from.
+  const dir = dirname(fileURLToPath(import.meta.url))
   const roots = [dir, join(dir, 'helpers')]
   const offenders = []
   for (const root of roots) {

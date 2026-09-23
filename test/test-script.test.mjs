@@ -27,9 +27,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readdir, readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const pkg = JSON.parse(await readFile(join(process.cwd(), 'package.json'), 'utf8'))
+// Anchored on this file's own location, not `process.cwd()`: the checks below are about the
+// package this test ships in, so running the file from another directory must not change
+// what they inspect (or silently make them read a different package.json).
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
+
+const pkg = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8'))
 const script = String(pkg.scripts?.test ?? '')
 
 /** The file arguments the script passes to `node --test`. */
@@ -39,7 +45,7 @@ function listedFiles() {
 }
 
 test('every test file on disk is listed in the npm test script', async () => {
-  const actual = (await readdir(join(process.cwd(), 'test')))
+  const actual = (await readdir(join(ROOT, 'test')))
     .filter((name) => name.endsWith('.test.mjs'))
     .map((name) => `test/${name}`)
     .sort()
@@ -74,7 +80,7 @@ test('the declared engine floor matches what the source actually needs', async (
   // reason here means the number cannot drift away from the code without a test noticing.
   const usesAbortSignalAny = await Promise.all(
     ['image.ts', 'openai.ts'].map(async (name) => {
-      const source = await readFile(join(process.cwd(), 'src', name), 'utf8')
+      const source = await readFile(join(ROOT, 'src', name), 'utf8')
       return source.includes('AbortSignal.any')
     }),
   )

@@ -54,16 +54,17 @@ function withTimeout(promise, ms, label) {
   ])
 }
 
-/** Asks the OS for a port nothing is using. */
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const probe = createServer()
-    probe.on('error', reject)
-    listenOnFetchablePort(probe).then(() => {
-      const { port } = probe.address()
-      probe.close(() => resolve(port))
-    })
-  })
+/** Asks for a port nothing is using, then releases it. */
+async function freePort() {
+  const probe = createServer()
+  // No `probe.on('error', reject)` here: the helper owns bind errors and retries when a
+  // port is already taken. A listener on the server would reject on the FIRST EADDRINUSE
+  // while the helper was still retrying, failing the test on a collision that the helper
+  // was already handling — and leaking the server it went on to bind.
+  await listenOnFetchablePort(probe)
+  const { port } = probe.address()
+  await new Promise((resolve) => probe.close(resolve))
+  return port
 }
 
 /** Raw request helper against an arbitrary port. */
