@@ -264,11 +264,63 @@ export interface ParseRequestContext {
   signal?: AbortSignal
 }
 
+/**
+ * Request fields this bridge accepts but cannot honour, and why.
+ *
+ * Silently dropping them is worse than refusing them: the caller gets a 200 and
+ * believes the option took effect. That is harmless for a field that only tunes
+ * sampling, and actively dangerous for one that changes the SHAPE of the answer —
+ * a caller that asked for `n: 3` and got one choice, or for
+ * `response_format: json_object` and got prose, has no way to notice until its own
+ * parser fails. `stop` and `tool_choice` are ordinary agent-tool parameters, so
+ * they are the ones most likely to arrive in practice.
+ *
+ * `stream_options.include_usage` is NOT in this list: the bridge always emits a
+ * usage frame on a clean stream, which satisfies `include_usage: true` and is a
+ * superset for `false`. Rejecting it would break clients that send it by default
+ * for no benefit.
+ *
+ * `seed`, `logprobs`, `presence_penalty`, `frequency_penalty`, `logit_bias` and
+ * `user` are also dropped, but they are sampling hints whose absence only changes
+ * the content of the answer, never its shape, so they stay permissive.
+ */
+const UNSUPPORTED_PARAMS: ReadonlyArray<{ field: string; reason: string }> = [
+  { field: 'n', reason: 'this bridge always returns exactly one choice' },
+  { field: 'stop', reason: 'the Command Code gateway has no stop-sequence parameter' },
+  { field: 'response_format', reason: 'the Command Code gateway has no response-format parameter' },
+  { field: 'tool_choice', reason: 'tool use cannot be forced or forbidden through the Command Code gateway' },
+  { field: 'parallel_tool_calls', reason: 'tool use cannot be forced or forbidden through the Command Code gateway' },
+]
+
+/**
+ * Rejects a request that asks for something this bridge cannot deliver.
+ *
+ * Only an EXPLICIT request is refused. An absent field is not a request for
+ * anything, and OpenAI's own defaults (`n: 1`, `tool_choice: 'auto'`,
+ * `parallel_tool_calls: true`) are already what the bridge does — refusing those
+ * would reject requests that are in fact satisfiable.
+ */
+function rejectUnsupportedParams(body: Record<string, unknown>): void {
+  for (const { field, reason } of UNSUPPORTED_PARAMS) {
+    if (!(field in body) || body[field] === undefined || body[field] === null) continue
+    if (field === 'n' && body[field] === 1) continue
+    if (field === 'tool_choice' && body[field] === 'auto') continue
+    if (field === 'parallel_tool_calls' && body[field] === true) continue
+    throw new ClientError(
+      `unsupported parameter: "${field}" — ${reason}`,
+      400,
+      field,
+      'unsupported_parameter',
+    )
+  }
+}
+
 export async function parseChatRequest(
   body: unknown,
   ctx: ParseRequestContext,
 ): Promise<ChatRequest> {
   if (!isRecord(body)) throw new ClientError('request body must be a JSON object')
+  rejectUnsupportedParams(body)
   const model = optionalString(body.model)
   if (model === undefined) throw new ClientError('missing required field: "model"')
   const rawTools = Array.isArray(body.tools) ? body.tools : undefined

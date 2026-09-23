@@ -17,6 +17,23 @@ Command Code 的订阅分两种:标准 Provider API(OpenAI 兼容,任何工具�
 - **自带 Web 控制台**:登录、凭据、账号池、模型列表一目了然,零配置上手
 - **零依赖桥**:无需 DSH / 任何框架,Node ≥ 20 即可运行,数据落盘在用户目录
 
+### 不支持的请求参数
+
+上游私有网关没有对应能力、因此**明确返回 400 `unsupported_parameter`**(而不是静默忽略)的字段:
+
+| 参数 | 原因 |
+| --- | --- |
+| `n` | 本桥固定只回 1 个 choice;`n: 1` 与缺省等价,照常接受 |
+| `stop` | Command Code 网关没有停止序列参数 |
+| `response_format` | 网关没有响应格式参数,`json_object` 无法生效 |
+| `tool_choice` | 无法强制或禁止工具调用;`auto`(缺省语义)照常接受 |
+| `parallel_tool_calls` | 同上;`true`(缺省语义)照常接受 |
+
+静默忽略会让调用方以为参数生效了——`n: 3` 只拿到 1 个 choice、要 JSON 却拿到散文,都要等到自己的解析器失败才发现。错误响应里的 `error.param` 会指明是哪个字段。
+
+以下字段会被忽略但**不报错**(只影响回答内容、不改变回答结构,或本桥行为已满足):
+`stream_options`(本桥在干净结束的流上**总是**发 usage,已覆盖 `include_usage: true`)、`seed`、`logprobs` / `top_logprobs`、`presence_penalty`、`frequency_penalty`、`logit_bias`、`user`。
+
 ## 界面预览
 
 ![控制台](assets/console.png)
