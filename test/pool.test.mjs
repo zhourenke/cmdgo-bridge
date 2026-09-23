@@ -122,12 +122,13 @@ test('pick skips disabled accounts and reports none when all are off', async () 
   assert.equal(pool.size, 2)
   assert.equal(pool.activeCount(), 2)
 
-  pool.toggle(one.id, false)
+  // `toggle` is async so the admin surface can await the manifest write.
+  assert.equal(await pool.toggle(one.id, false), true, 'toggling a known account reports the change')
   assert.equal(pool.activeCount(), 1)
   assert.notEqual(pool.pick()?.id, one.id, 'a disabled account must not be picked')
 
   const [other] = [pool.pick()].filter(Boolean)
-  pool.toggle(other.id, false)
+  await pool.toggle(other.id, false)
   assert.equal(pool.pick(), undefined, 'no enabled account means nothing to pick')
 
   await cleanup(dir)

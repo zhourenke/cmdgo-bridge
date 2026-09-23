@@ -170,9 +170,14 @@ export class AccountPool {
 
   /**
    * Persist the manifest. The payload is snapshotted at call time and the
-   * writes are serialized: `toggle` and `reportFailure` persist fire-and-forget,
-   * and unserialized renames can complete out of order, letting a stale
-   * snapshot overwrite a newer one.
+   * writes are serialized: `reportFailure` persists without awaiting, and
+   * unserialized renames can complete out of order, letting a stale snapshot
+   * overwrite a newer one.
+   *
+   * Never rejects: the write is best-effort, and a rejected promise here would
+   * be an unhandled rejection at the fire-and-forget call sites. The failure is
+   * logged instead, so a read-only data directory cannot silently discard
+   * account state.
    */
   private persist(): Promise<void> {
     const path = this.file
@@ -184,12 +189,34 @@ export class AccountPool {
         await writeFile(tmp, payload, 'utf8')
         await rename(tmp, path)
       } catch (error) {
-        this.log(`[cmdgo] 账号清单写入失败（不影响本次会话）：${error instanceof Error ? error.message : String(error)}`)
+        const message = error instanceof Error ? error.message : String(error)
+        this.log(`[cmdgo] 账号清单写入失败（不影响本次会话）：${message}`)
+        // Stderr as well as the log callback: the account state on disk is now
+        // out of step with memory, and a lost manifest is not a routine event.
+        console.error(`[cmdgo] 账号清单写入失败：${path} — ${message}`)
       }
     }
     const result = this.persistQueue.then(run, run)
     this.persistQueue = result
     return result
+  }
+
+  /**
+   * Waits for every queued manifest write to finish.
+   *
+   * Shutdown calls this so a `toggle` or a cool-down update made a moment before
+   * SIGTERM is not lost with the process. Also useful to tests that need the
+   * file on disk to reflect a mutation.
+   */
+  async flush(): Promise<void> {
+    // The queue can grow while draining (a write that schedules another), so
+    // re-check until it stops moving.
+    let seen = this.persistQueue
+    await seen
+    while (seen !== this.persistQueue) {
+      seen = this.persistQueue
+      await seen
+    }
   }
 
   async list(): Promise<PoolAccount[]> {
@@ -299,12 +326,20 @@ export class AccountPool {
     void this.persist()
   }
 
-  toggle(id: string, enabled: boolean): boolean {
+  /**
+   * Enable/disable one account and wait for the manifest to be written.
+   *
+   * Async so the admin endpoint can report a persistence failure instead of
+   * returning `{ok:true}` for a change that never reached disk — after a restart
+   * the account would silently be enabled again.
+   */
+  async toggle(id: string, enabled: boolean): Promise<boolean> {
+    await this.ensureLoaded()
     const account = this.accounts.find(a => a.id === id)
     if (account === undefined || account.enabled === enabled) return false
     account.enabled = enabled
     if (!enabled) account.cooldownUntil = undefined
-    void this.persist()
+    await this.persist()
     return true
   }
 

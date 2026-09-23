@@ -118,6 +118,13 @@ const WRITE_DRAIN_TIMEOUT_MS = 30_000
 
 /** Bytes buffered for a slow client before writes are throttled. */
 const WRITE_BUFFER_HIGH_WATER = 1 << 20
+
+/**
+ * How long an oversized request's connection is kept open waiting for the client
+ * to stop uploading, so the 413 is delivered instead of an RST. See
+ * `closeAfterOversize`.
+ */
+const OVERSIZE_CLOSE_TIMEOUT_MS = 3_000
 /**
  * 访问/聊天日志落盘：无论桥由谁启动(控制台 vs 双击脚本)都可追溯。
  * Follows the configured data directory so a `--data-dir` run does not scatter
@@ -531,15 +538,37 @@ export function createBridgeServer(state: BridgeState): Server {
    *
    * The body keeps being read (see `readBody`) so the 413 can reach the client,
    * which means an unbounded upload would otherwise hold the connection until it
-   * finished on its own. `destroySoon()` waits for the queued response bytes to
-   * flush before closing; a plain `destroy()` on `'finish'` is not equivalent —
-   * `'finish'` only means the response was handed to the socket, so destroying
-   * there discards the bytes still queued and the client sees a connection reset
-   * instead of the 413.
+   * finished on its own.
+   *
+   * The close is deliberately delayed until the client stops sending. Destroying
+   * a socket that still has unread request data arriving makes the stack emit an
+   * RST, and an RST discards whatever is still in flight in BOTH directions — so
+   * the client sees `ECONNRESET` instead of the 413 this whole path exists to
+   * deliver. (`destroySoon()` alone is not enough: it waits for OUR write queue,
+   * not for the peer to finish uploading.) Waiting for `'end'` costs nothing in
+   * the normal case, because a client that got `Connection: close` stops and
+   * closes its side promptly; `OVERSIZE_CLOSE_TIMEOUT_MS` bounds the pathological
+   * case where it keeps uploading anyway.
    */
   function closeAfterOversize(req: IncomingMessage, res: ServerResponse, status: number): void {
     if (status !== 413) return
-    res.once('close', () => req.socket.destroySoon())
+    const close = (): void => {
+      clearTimeout(timer)
+      req.off('end', close)
+      if (!req.socket.destroyed) req.socket.destroySoon()
+    }
+    const timer = setTimeout(close, OVERSIZE_CLOSE_TIMEOUT_MS)
+    timer.unref?.()
+    if (req.readableEnded) {
+      close()
+      return
+    }
+    res.once('close', () => {
+      // `'end'` was missed because the request was already complete; try now and
+      // let the timer cover the rest.
+      if (req.readableEnded) close()
+    })
+    req.once('end', close)
   }
 
   async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -812,7 +841,7 @@ export function createBridgeServer(state: BridgeState): Server {
       const body = await readBody(req)
       const id = typeof body.id === 'string' ? body.id : ''
       const enabled = body.enabled === true
-      const changed = id.length > 0 && pool.toggle(id, enabled)
+      const changed = id.length > 0 && await pool.toggle(id, enabled)
       json(res, changed ? 200 : 404, changed ? { ok: true } : { ok: false, error: '账号不存在或状态未变化' })
       return
     }

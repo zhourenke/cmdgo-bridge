@@ -11,8 +11,64 @@
  * @module cmdgo-bridge
  */
 
+import type { Server } from 'node:http'
+import { pathToFileURL } from 'node:url'
+
 import { ConfigStore, DEFAULT_DATA_DIR } from './config.js'
 import { buildState, createBridgeServer, isLoopbackHost } from './server.js'
+
+/** Grace period for in-flight requests during shutdown, before force-closing. */
+export const SHUTDOWN_GRACE_MS = 10_000
+
+export interface ShutdownOptions {
+  /** How long to wait for in-flight requests; see {@link SHUTDOWN_GRACE_MS}. */
+  graceMs?: number
+  /** Progress log; defaults to `console.log`. */
+  log?: (message: string) => void
+}
+
+/**
+ * Stops accepting work, waits briefly for in-flight responses, then flushes
+ * pending manifest writes.
+ *
+ * Exported and free of `process.exit` so the sequence itself can be tested:
+ * signal DELIVERY cannot be exercised on Windows (there `child.kill('SIGTERM')`
+ * terminates the process without running `'SIGTERM'` handlers), so the ordering
+ * this function guarantees — close, then flush — is otherwise untestable.
+ *
+ * Why a shutdown path exists at all: `toggle` and the account cool-down
+ * bookkeeping update `accounts.json` outside any request. Ctrl-C or a service
+ * restart landing between the in-memory change and the write would leave the
+ * operator seeing a disabled account enabled again, with nothing in the log.
+ */
+export async function shutdown(
+  server: Server,
+  pool: { flush(): Promise<void> },
+  reason: string,
+  options: ShutdownOptions = {},
+): Promise<void> {
+  const log = options.log ?? ((message: string) => console.log(message))
+  const graceMs = options.graceMs ?? SHUTDOWN_GRACE_MS
+  log(`[cmdgo] 收到 ${reason}，正在退出…`)
+  // `close()` stops new connections and waits for in-flight responses, so a long
+  // agent run can hold it for minutes. Bound the wait: past the grace period the
+  // flush matters more than the last few tokens.
+  const closed = new Promise<void>((resolve) => {
+    server.close(() => resolve())
+    server.closeIdleConnections?.()
+  })
+  const timer = setTimeout(() => {
+    log(`[cmdgo] 等待在途请求超时（${Math.round(graceMs / 1000)}s），强制关闭连接`)
+    server.closeAllConnections?.()
+  }, graceMs)
+  try {
+    await closed
+  } finally {
+    clearTimeout(timer)
+  }
+  await pool.flush()
+  log('[cmdgo] 账号清单已落盘，退出完成')
+}
 
 function parseArgs(argv: string[]): { host?: string; port?: number; dataDir?: string; help: boolean } {
   const out: { host?: string; port?: number; dataDir?: string; help: boolean } = { help: false }
@@ -114,10 +170,27 @@ http://127.0.0.1:<port>/ 使用控制台完成 OAuth 登录。`)
     console.log(`    apiKey : ${cfg.apiKey}`)
     console.log('')
   }
-  createBridgeServer(state)
+  const server = createBridgeServer(state)
+
+  let shuttingDown = false
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    process.on(signal, () => {
+      if (shuttingDown) return
+      shuttingDown = true
+      void shutdown(server, state.pool, signal).then(() => process.exit(0))
+    })
+  }
 }
 
-main().catch((error: unknown) => {
-  console.error(`[cmdgo] 启动失败：${error instanceof Error ? error.message : String(error)}`)
-  process.exit(1)
-})
+// Only start the server when this module is the entry point. Without the guard,
+// importing it (for `shutdown`, in tests) would boot a second bridge on the
+// configured port — and fight the one under test for the data directory.
+const isEntryPoint = process.argv[1] !== undefined
+  && import.meta.url === pathToFileURL(process.argv[1]).href
+
+if (isEntryPoint) {
+  main().catch((error: unknown) => {
+    console.error(`[cmdgo] 启动失败：${error instanceof Error ? error.message : String(error)}`)
+    process.exit(1)
+  })
+}
