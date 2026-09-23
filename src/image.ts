@@ -44,6 +44,15 @@ export interface ImageLimits {
   maxRedirects: number
   /** Permit remote URLs that resolve to loopback / private / link-local addresses. */
   allowPrivateNetwork: boolean
+  /**
+   * Permit fetching `http(s):` image URLs at all. Inline `data:` URLs are unaffected.
+   *
+   * Off means the bridge never makes an outbound request on a client's behalf: a
+   * caller that sends a URL instead of bytes gets a clear client error instead of
+   * the bridge reaching out to whatever host it named. Operators who want the bridge
+   * to be a pure pass-through — no egress prompted by client input — turn this off.
+   */
+  allowRemote: boolean
 }
 
 export const DEFAULT_IMAGE_LIMITS: ImageLimits = {
@@ -52,6 +61,7 @@ export const DEFAULT_IMAGE_LIMITS: ImageLimits = {
   fetchTimeoutMs: 15_000,
   maxRedirects: 3,
   allowPrivateNetwork: false,
+  allowRemote: true,
 }
 
 /** An image carried on a user message, normalized to base64. */
@@ -435,6 +445,14 @@ export async function fetchImage(
   limits: ImageLimits,
   signal?: AbortSignal,
 ): Promise<ImagePart> {
+  // Checked before the URL is even parsed: with remote fetching off there is no URL
+  // this function is allowed to accept, and failing here means no DNS lookup, no
+  // connection attempt and no redirect is ever made on a client's behalf.
+  if (limits.allowRemote === false) {
+    throw new ImageError(
+      'remote image URLs are disabled on this bridge (CMDGO_IMAGE_ALLOW_REMOTE=false); send the image inline as a data: URL instead',
+    )
+  }
   let url: URL
   try {
     url = new URL(rawUrl)

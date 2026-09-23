@@ -75,6 +75,17 @@ function applyImageEnv(cfg: ServerConfig, env: NodeJS.ProcessEnv): void {
   if (flag !== undefined && flag.trim() !== '') {
     cfg.images.allowPrivateNetwork = /^(1|true|yes|on)$/i.test(flag.trim())
   }
+  // Deliberately parsed differently from the switch above. That one defaults to
+  // `false`, so treating every unrecognized value as "off" is fail-closed and
+  // harmless. This one defaults to `true`, so the same rule would let a typo
+  // (`CMDGO_IMAGE_ALLOW_REMOTE=y`, `=enabled`) silently disable the switch the
+  // operator was trying to set. Here only an explicit off-value turns it off, and an
+  // unrecognized value leaves the configured setting alone.
+  const remote = env.CMDGO_IMAGE_ALLOW_REMOTE?.trim()
+  if (remote !== undefined && remote !== '') {
+    if (/^(1|true|yes|on)$/i.test(remote)) cfg.images.allowRemote = true
+    else if (/^(0|false|no|off)$/i.test(remote)) cfg.images.allowRemote = false
+  }
 }
 
 /**
@@ -200,6 +211,7 @@ export class ConfigStore {
         cfg.images.maxRedirects = raw.maxRedirects
       }
       if (typeof raw.allowPrivateNetwork === 'boolean') cfg.images.allowPrivateNetwork = raw.allowPrivateNetwork
+      if (typeof raw.allowRemote === 'boolean') cfg.images.allowRemote = raw.allowRemote
     }
     return cfg
   }

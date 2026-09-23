@@ -100,12 +100,20 @@ test('the README records every accepted risk (gate 5 / D-5)', () => {
   for (const finding of ['F-24', 'F-15', 'F-19', 'F-20', 'F-31', 'F-28', 'F-26', 'F-32']) {
     assert.ok(readme.includes(finding), `the accepted risk ${finding} is no longer recorded in README.md`)
   }
-  // F-24 must state the actual mitigation honestly, not promise a switch that does
-  // not exist. The env var below was in an early draft of the acceptance note and is
-  // NOT implemented anywhere in src/ — documenting it would send an operator to a
-  // setting that silently does nothing.
-  assert.doesNotMatch(readme, /CMDGO_IMAGE_ALLOW_REMOTE/,
-    'no such env var exists; remote images cannot be disabled by configuration')
+  // F-24 must state the actual mitigation honestly. An earlier draft of this check
+  // asserted the OPPOSITE — that `CMDGO_IMAGE_ALLOW_REMOTE` appeared nowhere, because
+  // at the time the README promised a switch that no code read, and documenting a
+  // nonexistent setting sends an operator to a knob that silently does nothing.
+  //
+  // The switch now exists (D-5 approved it; `src/config.ts` parses it and
+  // `src/image.ts` enforces it), so the assertion is inverted: the README must NAME
+  // it, and the acceptance note must say the race itself is still unmitigated rather
+  // than implying the switch removes it. The existence direction is covered by the
+  // `CMDGO_*` cross-check below.
+  assert.match(readme, /CMDGO_IMAGE_ALLOW_REMOTE/,
+    'the switch now exists, so the accepted-risk note must name it as the available mitigation')
+  assert.match(readme, /竞态本身未消除/,
+    'turning remote fetching off must not be described as fixing the rebinding race itself')
 })
 
 test('every CMDGO_* env var the README names as configuration actually exists in src/', async () => {

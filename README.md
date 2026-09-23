@@ -26,7 +26,7 @@ Command Code 的订阅分两种:标准 Provider API(OpenAI 兼容,任何工具�
 
 | 项 | 现状 | 影响与你自己能做的事 |
 | --- | --- | --- |
-| **远程图片的 DNS rebinding 竞态**(F-24) | 校验解析结果与真正发起连接之间存在时间差(TOCTOU):两次解析得到不同答案时,可能连到内网地址。链路本地地址已无条件拒绝,其余私网地址在 `allowPrivateNetwork: true` 时才放行 | **本桥没有"关闭远程图片"的开关**(`data:` 与远程 `http(s)` 都受支持)。因而这里只能靠部署侧兜底:不需要抓远程图就别开 `allowPrivateNetwork`;确实要抓内网图时,用网络层出站策略(`169.254.0.0/16`、`fe80::/10`、以及元数据端点)把元数据服务挡在桥之外——那才是真正的消除,`allowPrivateNetwork` 只是开关不是防护 |
+| **远程图片的 DNS rebinding 竞态**(F-24) | 校验解析结果与真正发起连接之间存在时间差(TOCTOU):两次解析得到不同答案时,可能连到内网地址。链路本地地址已无条件拒绝,其余私网地址在 `allowPrivateNetwork: true` 时才放行 | **竞态本身未消除**,但"干脆不抓远程图"这条路已经可用:`images.allowRemote: false`(或 `CMDGO_IMAGE_ALLOW_REMOTE=false`)只接受 `data:` 内联图片,桥不再替客户端发起任何出站请求,竞态随之不存在。仍要抓内网图时,再用网络层出站策略(`169.254.0.0/16`、`fe80::/10`、以及元数据端点)把元数据服务挡在桥之外——那才是真正的消除,`allowPrivateNetwork` 只是开关不是防护 |
 | **`SESSION_ID` 保持不变**(F-15) | 上游指纹里的 `x-session-id` 沿用原值,不做每请求随机化 | 改它可能让上游 prompt cache 失效(成本上升),故不改。这是有意的取舍 |
 | **OAuth 回调的 `?error=` 处理**(F-19) | 未确认 Command Code Studio 的回调是否携带 `state`,因此**未改动**错误分支的处理逻辑 | 授权被拒时请以控制台显示的错误为准,不要只看 URL |
 | **`Access-Control-Allow-Private-Network` 响应头**(F-20) | 保留该头(私有网络访问功能需要它);已确认回调服务器会正常关闭 | 该头本身不放行任何请求,真正的授权仍由浏览器弹窗决定 |
@@ -184,12 +184,15 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `images.fetchTimeoutMs` | `15000` | 远程图片 URL 抓取超时 |
 | `images.maxRedirects` | `3` | 远程图片 URL 允许的重定向跳数 |
 | `images.allowPrivateNetwork` | `false` | 是否允许远程图片 URL 指向回环 / 内网地址。**开启后 `169.254.0.0/16` 与 `fe80::/10` 仍然被拒**(见下) |
+| `images.allowRemote` | `true` | 是否允许抓取 `http(s):` 图片 URL。设为 `false` 后**只接受 `data:` 内联图片**,客户端再给 URL 会得到一个明确的客户端错误,桥不会替它发起任何出站请求(见下) |
 
 命令行参数:`--host <addr>`、`--port <port>`、`--data-dir <dir>`、`--help`。注意:`--host` / `--port` 会**写回 `config.json` 持久化**,下次启动继续生效——一次 `--host 0.0.0.0` 会**永久**改变绑定地址,直到你再显式改回来。
 
 `reasoning_effort` 的取值会先 `trim()` 并转小写,再判断:`''` / `off` / `none` / `disabled`(任意大小写)一律**省略该字段**——网关把"不推理"表达为字段缺省,而不是某个特定取值;其余值(如 `low` / `medium` / `high` / `minimal`)转小写后原样透传,具体可用集合由网关定义。所以 `"OFF"`、`"High"`、`" high "` 都能按预期工作,不会因为大小写或空格被上游拒绝。
 
-图片限制也可用环境变量临时覆盖(优先级高于 `config.json`):`CMDGO_IMAGE_MAX_MB`、`CMDGO_IMAGE_MAX_PER_REQUEST`、`CMDGO_IMAGE_FETCH_TIMEOUT_MS`、`CMDGO_IMAGE_ALLOW_PRIVATE_NETWORK`。
+图片限制也可用环境变量临时覆盖(优先级高于 `config.json`):`CMDGO_IMAGE_MAX_MB`、`CMDGO_IMAGE_MAX_PER_REQUEST`、`CMDGO_IMAGE_FETCH_TIMEOUT_MS`、`CMDGO_IMAGE_ALLOW_PRIVATE_NETWORK`、`CMDGO_IMAGE_ALLOW_REMOTE`。
+
+`CMDGO_IMAGE_ALLOW_REMOTE` 的解析与 `CMDGO_IMAGE_ALLOW_PRIVATE_NETWORK` **不同**,这是有意的:后者默认 `false`,把任何无法识别的值当作 `false` 是"失败即关闭",无害;前者默认 `true`,若沿用同一规则,一个笔误(如 `CMDGO_IMAGE_ALLOW_REMOTE=y`、`=enabled`)会**静默关掉**运营者本想打开的开关。所以这里只有明确的关闭值(`0` / `false` / `no` / `off`,不分大小写)才会关闭,无法识别的值一律**保持**配置里的设置不变。
 
 ## API 端点
 
@@ -341,6 +344,17 @@ CMDGO_TEST_NETWORK=1 node --test test/catalog-pin.test.mjs
 - **请求本身会发出去**:桥只接受图片字节(魔数嗅探会拒掉非图片响应),但这属于**盲 SSRF**——请求已经到达内网端点,足以用来探测服务或触发未鉴权的状态变更接口。所以别对不可信来源开启它。
 
 `169.254.x` 不是可路由到链路之外的地址,内网图床不会用它,所以保留这条拒绝不影响真正需要该开关的场景。
+
+### 彻底关掉远程抓图:`allowRemote` / `CMDGO_IMAGE_ALLOW_REMOTE`
+
+上面那个开关管的是"远程地址允许指向哪里",这个开关管的是"**允不允许远程抓取**"。把 `images.allowRemote` 设为 `false`,或设环境变量 `CMDGO_IMAGE_ALLOW_REMOTE=false`,桥就**只接受 `data:` 内联图片**:
+
+- 客户端再传 `http(s):` URL 会得到一个明确的客户端错误(写明本桥已关闭远程抓取、请改为内联),而不是被静默忽略;
+- 桥**不会**替客户端发起任何出站请求——DNS 不查、连接不建、重定向不跟。检查在 URL 解析之前完成。
+
+用途:把桥当作对外中转站的上游、或者你希望**出站流量完全不被客户端输入左右**时,这是唯一能在不改代码的情况下关掉这条路的方式。默认 `true`,即保持原有行为。
+
+注意它和 `allowPrivateNetwork` 是**正交**的:关掉远程抓取后,`allowPrivateNetwork` 设成什么都没意义(远程根本不会被抓);反过来,开着远程抓取也不会因为 `allowPrivateNetwork` 是 `false` 就只限制在公网之外——它本来就只管私网地址那一条。
 
 **缓存复用**:上游的 prompt cache 是**前缀缓存**,因此实现上刻意保证——不含图片的消息仍序列化为原来的纯字符串 `content`,与加入图片功能之前的信封逐字节一致;同一张图片的 base64 编码是确定性的(不重新编码)。所以纯文本会话不会因为本功能丢掉任何缓存,而带图会话只要图片字节不变,重复请求也能命中前缀缓存。
 
