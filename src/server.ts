@@ -241,11 +241,28 @@ export function isLoopbackHost(host: string): boolean {
  * Whether the `Host` header names something the admin surface may answer to.
  *
  * Without this, a DNS-rebinding page (`evil.com` resolving to 127.0.0.1) is
- * same-origin with the bridge and sails past the `Origin` check below. Only
- * loopback names, IP literals, the configured bind host and anything listed in
- * `allowedHosts` are accepted, so a rebound request carrying `Host: evil.com`
- * is refused. Operators behind a reverse proxy or a LAN name add it to
- * `allowedHosts` in config.json.
+ * same-origin with the bridge and sails past the `Origin` check below. The check
+ * therefore works on the NAME, not on where it resolves: a rebound request carrying
+ * `Host: evil.com` is refused because `evil.com` is a domain, while
+ * `Host: 127.0.0.1` is answered.
+ *
+ * **Every IP literal is accepted, including non-loopback ones** (`8.8.8.8`,
+ * `[fd00::1]`), and that is deliberate rather than an oversight (F-03):
+ *
+ * - The admin surface is not protected by this check alone. What protects it is
+ *   `isLoopbackHost` + the source-address check on `/api/*` (see `adminAllowed`),
+ *   and D-3's startup warning when the bind address is not loopback. A request from
+ *   another machine is refused on its SOURCE, whatever its `Host` says.
+ * - `allowedHosts` exists so an operator can reach the console through a LAN name or
+ *   a reverse proxy. Rejecting IP literals would break the other common way to do
+ *   that — `http://192.168.1.20:11435/` — and would do so with a confusing 403 that
+ *   `allowedHosts` cannot fix for an address that changes with DHCP.
+ * - Restricting literals to 127.x would buy nothing: an attacker who can make the
+ *   bridge see `Host: 8.8.8.8` can equally send `Host: 127.0.0.1`. The header is
+ *   attacker-controlled, so it cannot be the thing that distinguishes a local
+ *   client from a remote one.
+ *
+ * Domain names other than `localhost` must be listed in `allowedHosts`.
  */
 function hostAllowed(req: IncomingMessage, cfg: ServerConfig): boolean {
   const host = req.headers.host

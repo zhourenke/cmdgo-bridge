@@ -33,8 +33,9 @@ export interface ServerConfig {
   /**
    * Extra `Host` header names the console/admin surface may answer to, for
    * deployments reached through a reverse proxy or a LAN name. Loopback names,
-   * IP literals and `host` itself are always accepted; anything else is refused
-   * so a DNS-rebound page cannot read the client API key.
+   * **all** IP literals (not just loopback ones — see `hostAllowed`) and `host`
+   * itself are always accepted; anything else is refused so a DNS-rebound page
+   * cannot read the client API key.
    */
   allowedHosts: string[]
   /** Image (`image_url`) intake limits. */

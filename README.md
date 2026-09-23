@@ -6,6 +6,20 @@
 
 Command Code 的订阅分两种:标准 Provider API(OpenAI 兼容,任何工具可直连)和 **Go 套餐**($1/月)。Go 套餐调官方 OpenAI 端点返回 `403 upgrade_required`,只能走 CLI 私有网关 `POST /alpha/generate`。本项目把 Go 订阅包装成 **OpenAI 兼容 API**——Cherry Studio、Cline、Roo Code、Continue、Cursor、ZCode 等所有支持自定义 OpenAI 端点的工具都能直接用,自带 Web 控制台完成 OAuth 登录与多账号池管理。
 
+## 定位与边界
+
+**非官方项目,仅限个人 / 小范围非商业共享使用,请遵守 Command Code 的服务条款。** 目标场景就是字面意思:一台机器上跑一个实例,回环监听(`127.0.0.1`),本人和两三位室友/朋友把自己的 Agent 工具指过来,共用同一个上游订阅。本项目的设计与验证都基于这个规模,**不含任何面向第三方的计费、SLA 或用量承诺**。
+
+按这个定位,以下几件事是**有意不做**的,不是遗漏:
+
+- **没有 per-consumer key / 租户隔离 / 按 key 计量**(F-28)。下游只有 `config.json` 里**一个** `apiKey`,不区分是谁在用,`access.log` 也不做归因。三人共享一个 token 是预期用法;轮换 token 因此是**全局**操作,所有人都要换。
+- **没有按 key 的配额或限流**,只有**全局并发上限 16**(F-09/F-10)。这个上限的目的不是防滥用,而是**防自伤**:三人同时开工、加上 Agent 工具的自动重试,很容易把上游额度打满或触发 429 风暴。
+- **没有 `/metrics` 端点、没有结构化日志管道**(F-26)。只有 `access.log`(5 MiB × 3 轮转)、stderr 上的失败上报,以及 `GET /health` 的聚合计数与延迟分位。
+- **不改上游请求指纹**(`CC_VERSION` / `x-command-code-version` / `SESSION_ID`)。这些字段决定了 Go 套餐路径能不能用,以"合规"为理由改动会让桥**直接不可用**;风险由使用者自行判断并承担。
+- **不做多实例共享同一 data-dir 的文件锁**(F-32)。一个 data-dir 只给一个实例用;并发写会以"最后写入者获胜"的方式互相覆盖账号清单。
+
+需要对外提供稳定服务、需要计量或需要多租户时,请在前面接一层带鉴权与计量的反向代理/网关,而不是期待本桥承担这些职责。
+
 ## 功能特性
 
 - **OpenAI 兼容 API**:`POST /v1/chat/completions`(流式 / 非流式)、`GET /v1/models`,支持工具调用、`reasoning_effort`、`max_tokens`、`temperature` / `top_p`
@@ -33,6 +47,14 @@ Command Code 的订阅分两种:标准 Provider API(OpenAI 兼容,任何工具�
 
 以下字段会被忽略但**不报错**(只影响回答内容、不改变回答结构,或本桥行为已满足):
 `stream_options`(本桥在干净结束的流上**总是**发 usage,已覆盖 `include_usage: true`)、`seed`、`logprobs` / `top_logprobs`、`presence_penalty`、`frequency_penalty`、`logit_bias`、`user`。
+
+### usage 与计费口径
+
+回包里的 `usage` 字段有两个**会直接影响账单核对**的性质,务必知道:
+
+- **`completion_tokens` 是输出总量,`completion_tokens_details.reasoning_tokens` 是其中的一部分**(思维链 token)。也就是说 `completion_tokens ≥ reasoning_tokens`。上游有时只给 `outputTokens` 而不给细分,此时本桥按 `textTokens + reasoningTokens` **合成** `completion_tokens`(D-4a),而不是退回 0——退回 0 会让"少计 99.8%"这种事静默发生(审计实测 F-06)。
+- **推理型模型的 `reasoning_tokens` 往往占大头。** 一次只输出两三行答案的请求,`completion_tokens` 可能高达数千,其中绝大部分是思维链。**按输出 token 计费或做预算的下游必须把这部分算进去**,否则会严重低估成本。
+- **失败路径不发 `usage`、也不发 `[DONE]`**(D-4b):只发一个 error 事件然后结束。所以"有 `usage`"就等于"这次生成真的完成了";拿到 usage 却按 0 计费、或把截断的流当成完整回答,都是本桥刻意避免的情况。没有内容的成功请求(如上游返回空体)是**真的** 0 token,与失败完全不同。
 
 ### `max_tokens` 与模型上下文窗口
 
@@ -127,6 +149,9 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 每完成一次 OAuth 登录,新 key 自动成为池中一个独立账号(元数据落在数据目录 `accounts.json`,key 在 `credentials.json`);重复登录同一 key 只刷新标签。
 
 - 请求级 **round-robin** 调度;某账号失败按指数冷却(30s 起、封顶 15min),当次请求内自动切换下一账号
+- **不是所有失败都值得换账号。** 只有这五类会触发当次请求内的故障转移:`AUTH`(401/403 凭据失效)、`RATE_LIMIT`(429)、`SERVER`(5xx)、`TRANSPORT`(连接/超时/TLS)、`PERMISSION`(套餐不允许该模型)。其它错误(参数非法、请求体超限、上下文超限等)对**每个**账号都会同样失败,所以立即返回,不做无谓重试
+- 一次请求最多切换 **4** 次(`min(池大小, 4)`)。池子很大时也会在 4 次后放弃,避免"上游整体故障"被放大成 N 次重试把额度打空
+- **已经吐出内容之后不会再换账号**:一旦开始流式输出,失败就如实报错(见「失败流的行为」),绝不重放半截回答——否则下游会拿到两段拼接的回答,或为同一次生成重复计费
 - 控制台可**停用 / 启用 / 移除**单个账号,「清空账号池」清空全部
 
 ## 配置
@@ -148,7 +173,9 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `images.maxRedirects` | `3` | 远程图片 URL 允许的重定向跳数 |
 | `images.allowPrivateNetwork` | `false` | 是否允许远程图片 URL 指向回环 / 内网地址。**开启后 `169.254.0.0/16` 与 `fe80::/10` 仍然被拒**(见下) |
 
-命令行参数:`--host <addr>`、`--port <port>`、`--data-dir <dir>`、`--help`。注意:`--host` / `--port` 会**写回 `config.json` 持久化**,下次启动继续生效。
+命令行参数:`--host <addr>`、`--port <port>`、`--data-dir <dir>`、`--help`。注意:`--host` / `--port` 会**写回 `config.json` 持久化**,下次启动继续生效——一次 `--host 0.0.0.0` 会**永久**改变绑定地址,直到你再显式改回来。
+
+`reasoning_effort` 的取值会先 `trim()` 并转小写,再判断:`''` / `off` / `none` / `disabled`(任意大小写)一律**省略该字段**——网关把"不推理"表达为字段缺省,而不是某个特定取值;其余值(如 `low` / `medium` / `high` / `minimal`)转小写后原样透传,具体可用集合由网关定义。所以 `"OFF"`、`"High"`、`" high "` 都能按预期工作,不会因为大小写或空格被上游拒绝。
 
 图片限制也可用环境变量临时覆盖(优先级高于 `config.json`):`CMDGO_IMAGE_MAX_MB`、`CMDGO_IMAGE_MAX_PER_REQUEST`、`CMDGO_IMAGE_FETCH_TIMEOUT_MS`、`CMDGO_IMAGE_ALLOW_PRIVATE_NETWORK`。
 
@@ -166,11 +193,22 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `POST /api/reload` | 无鉴权，**仅回环来源** | 重新读取 `accounts.json` 与 `credentials.json`（手改文件后免重启；解析失败返回 500 并说明是哪个文件） |
 | `POST /api/rotate-key` | 无鉴权，**仅回环来源** | 轮换客户端 API key；返回新值，旧值**立即失效**，无需重启 |
 
+**只实现了上表这些端点。** 未列出的路径不会"尽力兼容"，而是明确的 404：
+
+| 未实现 | 返回 | 说明 |
+| --- | --- | --- |
+| `POST /v1/completions` | 404 | 旧版补全端点。部分老客户端（早期 Cline / 某些 SDK 的 `Completion.create`）会先试它，看到 404 后才回退到 chat；直接配 chat 端点可省一次无用请求 |
+| `POST /v1/embeddings`、`/v1/audio/*`、`/v1/images/*` | 404 | Go 套餐的私有网关只做对话生成，没有这些能力 |
+| `GET /v1`（无尾斜杠） | 404 | 鉴权只覆盖 `/v1/` 前缀下的路径，`/v1` 与 `/v1x/...` 都落在保护之外并返回 404，不会泄露任何信息 |
+| `DELETE` / `PUT` 到 `/api/*` | 404 | 管理面只认上表列出的 `POST`，其它方法落到"未知动作"分支 |
+
 > **管理面（`/api/*`、`/health`、控制台页面）不携带 token**。它额外校验 `Origin` 同源与 `Host` 白名单:其它站点发起的**浏览器跨源请求**、以及把域名解析到回环地址的 DNS rebinding 都会被 403 拒绝。
 >
 > ⚠️ 这两道校验**只对浏览器有效**。`curl`、脚本、以及任何非浏览器客户端都不发送 `Origin`，因此会被直接放行——这正是「无 `Origin` 的真实请求返回 200」这一既有行为。所以**管理面的实际边界取决于监听地址**：保持默认 `127.0.0.1` 时只有本机可达；一旦绑定 `0.0.0.0`，网络内任何客户端都能读取 `apiKey` 并清空账号池。
 >
 > 为此设置了两道纵深防御：绑定非回环地址时启动会打印显著告警；`/api/status` 对**非回环来源**的请求不下发 `apiKey` 字段（控制台此时显示「非回环来源，已隐去」）。`/v1/*` 保持宽松 CORS，由 Bearer token 保护。
+>
+> **`Host` 白名单按"名字"判定,不看解析结果,且接受任意 IP 字面量**(包括 `8.8.8.8`、`[fd00::1]` 这类非回环地址)。这不是疏漏:它能挡的是**域名**形式的 DNS rebinding(`evil.com` → 127.0.0.1 时 `Host: evil.com` 是域名,403),而**挡住远端客户端的是来源地址校验**,不是 `Host`——`Host` 头完全由请求方控制,一个能发 `Host: 8.8.8.8` 的客户端同样能发 `Host: 127.0.0.1`,所以字面量分支不可能是区分本机与远端的那道线。反过来,收紧成"只接受回环字面量"会让 `http://192.168.1.20:11435/` 这种局域网直连方式直接 403,而 DHCP 地址根本没法靠 `allowedHosts` 固定下来。**只允许访问控制台的域名需要写进 `allowedHosts`。**
 
 ### 停机与落盘
 
@@ -206,6 +244,10 @@ curl.exe -s -o NUL -w "new=%{http_code}`n" -H "Authorization: Bearer <新token>"
 ```
 
 > 两种方式的区别：控制台轮换**不需要重启**（`authorized()` 每次请求都读当前配置），命令行方式**必须重启**。
+>
+> ⚠️ **轮换后必须同步更新每一个下游工具**，否则它们全部 401。旧 token 是**立刻**失效的（轮换前后各发一次即可验证），没有宽限期：室友/朋友那边凡是填了这个 key 的地方——Cursor 的 API Key、`OPENAI_API_KEY` 环境变量、写进 `~/.codex/config.toml` 之类的配置文件、CI secret——都要换成新值。分发新 token 时优先用一次性渠道，别丢进群聊记录里。
+>
+> 只想**撤销某个人**的访问而不折腾其他人时，注意本桥**只有一个下游 token**（没有 per-user key / 按 key 计量，见下文「定位与边界」），所以轮换是全局的：所有人都要换。
 >
 > 手改文件用无 BOM 的 UTF-8 最稳妥，但**带 BOM 也不会再出问题**：三个状态文件（`config.json` / `credentials.json` / `accounts.json`）现在都会先剥掉 UTF-8 BOM 再解析。此前 BOM 会让 `config.json` 被判定为损坏并**静默重新随机生成**一个 key（所有下游 401，且日志不说明原因），也会让 `accounts.json` / `credentials.json` 读成"空"，进而被下一次写入覆盖掉——这也是控制台「轮换」按钮存在的原因。
 
