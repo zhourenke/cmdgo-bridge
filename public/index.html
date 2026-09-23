@@ -356,16 +356,21 @@ curl http://127.0.0.1:PORT/v1/chat/completions \
 
     /* config */
     var demo = /[?&]demo=1/.test(location.search);
-    var shownKey = demo ? 'sk-' + snap.apiKey.slice(0, 4) + '••••••••' : snap.apiKey;
+    /* 回环来源才拿得到 apiKey；非回环来源服务端会隐去该字段。 */
+    var keyVisible = typeof snap.apiKey === 'string' && snap.apiKey.length > 0;
+    var shownKey = !keyVisible ? '（非回环来源，已隐去）'
+      : demo ? 'sk-' + snap.apiKey.slice(0, 4) + '••••••••' : snap.apiKey;
     $('cfgEndpoint').textContent = snap.endpoint;
     $('cfgApiKey').value = shownKey;
     $('cfgRef').textContent = snap.credentialRef;
-    document.querySelector('pre.curl').textContent =
-      '# 任何 OpenAI 兼容客户端都可以用（Cherry Studio / Cline / Continue / Cursor 自定义供应商…）\n'
-      + 'curl ' + snap.endpoint + '/chat/completions \\\n'
-      + '  -H "Authorization: Bearer ' + shownKey + '" \\\n'
-      + '  -H "Content-Type: application/json" \\\n'
-      + '  -d \'{"model":"' + (snap.modelIds[0] || '<模型ID>') + '","messages":[{"role":"user","content":"你好"}]}\'';
+    document.querySelector('pre.curl').textContent = !keyVisible
+      ? '# 本页不是从回环地址打开的，服务端已隐去 API key。\n'
+        + '# 请在运行 cmdgo-bridge 的机器上打开 http://127.0.0.1:' + (location.port || '11435') + '/'
+      : '# 任何 OpenAI 兼容客户端都可以用（Cherry Studio / Cline / Continue / Cursor 自定义供应商…）\n'
+        + 'curl ' + snap.endpoint + '/chat/completions \\\n'
+        + '  -H "Authorization: Bearer ' + shownKey + '" \\\n'
+        + '  -H "Content-Type: application/json" \\\n'
+        + '  -d \'{"model":"' + (snap.modelIds[0] || '<模型ID>') + '","messages":[{"role":"user","content":"你好"}]}\'';
 
     /* accounts */
     $('acctCount').textContent = snap.activeAccounts + '/' + poolCount;
@@ -456,6 +461,10 @@ curl http://127.0.0.1:PORT/v1/chat/completions \
       return;
     }
     if (t.id === 'btnKeyCopy' && snap) {
+      if (typeof snap.apiKey !== 'string' || snap.apiKey.length === 0) {
+        t.textContent = '非回环来源不可复制'; setTimeout(function () { t.textContent = '复制'; }, 1500);
+        return;
+      }
       copyText(snap.apiKey).then(function () { t.textContent = '已复制 ✓'; setTimeout(function () { t.textContent = '复制'; }, 1500); });
       return;
     }

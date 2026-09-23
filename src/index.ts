@@ -12,7 +12,7 @@
  */
 
 import { ConfigStore, DEFAULT_DATA_DIR } from './config.js'
-import { buildState, createBridgeServer } from './server.js'
+import { buildState, createBridgeServer, isLoopbackHost } from './server.js'
 
 function parseArgs(argv: string[]): { host?: string; port?: number; dataDir?: string; help: boolean } {
   const out: { host?: string; port?: number; dataDir?: string; help: boolean } = { help: false }
@@ -58,6 +58,21 @@ http://127.0.0.1:<port>/ 使用控制台完成 OAuth 登录。`)
   if (args.host !== undefined) cfg.host = args.host
   if (args.port !== undefined) cfg.port = args.port
   await store.save(cfg)
+
+  // `--host`/`--port` are written back above, so a single mistaken `--host
+  // 0.0.0.0` keeps reaching the network across every later restart. Say so
+  // loudly: the admin surface carries no token, and `/api/status` hands out the
+  // only credential `/v1/*` accepts.
+  if (!isLoopbackHost(cfg.host)) {
+    console.warn('')
+    console.warn('  ⚠️  警告：监听地址不是回环地址（当前 ' + cfg.host + '）')
+    console.warn('     · 管理面（/api/*、/health、控制台页面）没有鉴权，网络内任何客户端都能访问')
+    console.warn('     · 其中 GET /api/status 会返回客户端 API key，POST /api/logout 会清空账号池')
+    console.warn('     · 该地址已写入 config.json，重启后依然生效')
+    console.warn('     · 仅本机使用请改回 127.0.0.1：node dist/index.js --host 127.0.0.1')
+    console.warn('     · 确需局域网共享：请在前面加带鉴权的反向代理，并把 /api/* 限制为回环来源')
+    console.warn('')
+  }
 
   const state = buildState(cfg, store.dataDir)
   state.onError = (error: NodeJS.ErrnoException) => {

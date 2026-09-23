@@ -92,6 +92,40 @@ function cors(res: ServerResponse): void {
 /** IPv4 literal, e.g. 192.168.1.10. */
 const IPV4_LITERAL = /^\d{1,3}(?:\.\d{1,3}){3}$/
 
+/** IPv4-mapped IPv6 (`::ffff:127.0.0.1`), which Node reports for v4 clients on a dual-stack socket. */
+const IPV4_MAPPED = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i
+
+/**
+ * Whether a socket address is the local machine.
+ *
+ * Used to decide whether the admin surface may disclose the bearer token: with
+ * `--host 0.0.0.0` any LAN client reaches `/api/status`, and the token it
+ * returns is the only credential `/v1/*` has.
+ */
+function isLoopbackAddress(address: string | undefined): boolean {
+  if (address === undefined || address.length === 0) return false
+  const bare = address.replace(/^\[|\]$/g, '')
+  const mapped = IPV4_MAPPED.exec(bare)
+  if (mapped?.[1] !== undefined) return isLoopbackAddress(mapped[1])
+  if (bare === '::1') return true
+  return /^127\./.test(bare)
+}
+
+/**
+ * Whether a configured bind host keeps the admin surface on this machine.
+ *
+ * A hostname (anything that is not an IP literal) is treated as non-loopback:
+ * `localhost` is the one exception, and `0.0.0.0`/`::` are explicitly exposed
+ * because those are the wildcard binds that reach the network.
+ */
+export function isLoopbackHost(host: string): boolean {
+  const name = host.trim().toLowerCase().replace(/^\[|\]$/g, '')
+  if (name === 'localhost') return true
+  if (name === '0.0.0.0' || name === '::' || name === '*') return false
+  if (IPV4_LITERAL.test(name)) return /^127\./.test(name)
+  return name === '::1'
+}
+
 /**
  * Whether the `Host` header names something the admin surface may answer to.
  *
@@ -221,7 +255,8 @@ export function createBridgeServer(state: BridgeState): Server {
     provider: string
     baseURL: string
     endpoint: string
-    apiKey: string
+    /** 仅在回环来源请求时下发；见 {@link statusSnapshot}。 */
+    apiKey?: string
     maxTokens: number
     modelCount: number
     modelIds: string[]
@@ -230,7 +265,17 @@ export function createBridgeServer(state: BridgeState): Server {
     accounts: unknown[]
   }
 
-  async function statusSnapshot(): Promise<StatusSnapshot> {
+  /**
+   * Builds the console snapshot.
+   *
+   * `includeApiKey` must only be true for loopback callers. The admin surface is
+   * unauthenticated, so with `--host 0.0.0.0` a bare `curl http://<lan-ip>:11435/
+   * api/status` would otherwise hand any client on the network the bearer token
+   * that `/v1/*` accepts — and the same reachability lets it POST `/api/logout`
+   * to wipe the pool. Binding to loopback (the default) keeps this dormant; the
+   * check is depth in case the bind is ever widened.
+   */
+  async function statusSnapshot(includeApiKey: boolean): Promise<StatusSnapshot> {
     const snapshot = models()
     const now = Date.now()
     const rows = await Promise.all((await pool.list()).map(async (account: PoolAccount) => {
@@ -255,7 +300,7 @@ export function createBridgeServer(state: BridgeState): Server {
       provider: 'commandcode',
       baseURL: cfg.baseURL,
       endpoint,
-      apiKey: cfg.apiKey,
+      ...(includeApiKey ? { apiKey: cfg.apiKey } : {}),
       maxTokens: cfg.maxTokens,
       modelCount: snapshot.length,
       modelIds: snapshot.map(m => m.id),
@@ -475,7 +520,11 @@ export function createBridgeServer(state: BridgeState): Server {
     await pool.ensureLoaded()
     const action = pathname.slice('/api'.length) || '/'
     if (req.method === 'GET' && (action === '/status' || action === '/')) {
-      json(res, 200, await statusSnapshot())
+      const fromLoopback = isLoopbackAddress(req.socket.remoteAddress)
+      if (!fromLoopback) {
+        logLine(`[cmdgo] 非回环来源 ${req.socket.remoteAddress ?? '?'} 读取 /api/status：已隐去 apiKey（管理面无鉴权，请勿把监听地址设为 0.0.0.0）`)
+      }
+      json(res, 200, await statusSnapshot(fromLoopback))
       return
     }
     if (req.method === 'POST' && action === '/login') {
@@ -571,7 +620,7 @@ export function createBridgeServer(state: BridgeState): Server {
         return
       }
       if (req.method === 'GET' && pathname === '/health') {
-        const snapshot = await statusSnapshot()
+        const snapshot = await statusSnapshot(false)
         json(res, 200, {
           ok: true,
           service: 'cmdgo-bridge',

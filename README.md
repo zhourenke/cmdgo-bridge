@@ -105,7 +105,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `host` | `127.0.0.1` | 监听地址;`0.0.0.0` 局域网共享时 `/v1` 靠 API key 鉴权,控制台与管理面仅接受同源请求 |
+| `host` | `127.0.0.1` | 监听地址。**改成非回环地址（如 `0.0.0.0`）会让无鉴权的管理面暴露给网络内任何客户端**：`/api/status` 会返回客户端 API key，`/api/logout` 会清空账号池。启动时会打印显著告警；非回环来源的 `/api/status` 不再下发 `apiKey`（见下） |
 | `port` | `11435` | 监听端口 |
 | `baseURL` | `https://api.commandcode.ai` | 网关 base,`/alpha/generate` 自动追加 |
 | `apiKey` | 随机生成 | 客户端 Bearer token(改动手动写入需 ≥8 字符) |
@@ -128,13 +128,17 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | --- | --- | --- |
 | `GET /v1/models` | Bearer | 模型列表(含 `context_length` 上下文容量) |
 | `POST /v1/chat/completions` | Bearer | 对话补全(流式 / 非流式) |
-| `GET /health` | 无 | 健康检查 |
+| `GET /health` | 无 | 健康检查(不含任何凭据) |
 | `GET /` | 无 | 控制台页面 |
-| `GET /api/status` | 无鉴权,仅同源 | 登录 / 账号 / 模型状态快照 |
-| `POST /api/login` `cancel` `logout` | 无鉴权,仅同源 | 登录生命周期 |
-| `POST /api/account/toggle` `remove` | 无鉴权,仅同源 | 账号管理 |
+| `GET /api/status` | 无鉴权 | 登录 / 账号 / 模型状态快照;**仅回环来源**的响应包含 `apiKey` |
+| `POST /api/login` `cancel` `logout` | 无鉴权 | 登录生命周期 |
+| `POST /api/account/toggle` `remove` | 无鉴权 | 账号管理 |
 
-> 管理面(`/api/*`、`/health`、控制台页面)不携带 token,因此额外校验 `Origin` 同源与 `Host` 白名单:其它站点发起的跨源请求、以及把域名解析到回环地址的 DNS rebinding 都会被 403 拒绝。`/v1/*` 保持宽松 CORS,由 Bearer token 保护。
+> **管理面（`/api/*`、`/health`、控制台页面）不携带 token**。它额外校验 `Origin` 同源与 `Host` 白名单:其它站点发起的**浏览器跨源请求**、以及把域名解析到回环地址的 DNS rebinding 都会被 403 拒绝。
+>
+> ⚠️ 这两道校验**只对浏览器有效**。`curl`、脚本、以及任何非浏览器客户端都不发送 `Origin`，因此会被直接放行——这正是「无 `Origin` 的真实请求返回 200」这一既有行为。所以**管理面的实际边界取决于监听地址**：保持默认 `127.0.0.1` 时只有本机可达；一旦绑定 `0.0.0.0`，网络内任何客户端都能读取 `apiKey` 并清空账号池。
+>
+> 为此设置了两道纵深防御：绑定非回环地址时启动会打印显著告警；`/api/status` 对**非回环来源**的请求不下发 `apiKey` 字段（控制台此时显示「非回环来源，已隐去」）。`/v1/*` 保持宽松 CORS，由 Bearer token 保护。
 
 ## 图片输入
 
@@ -186,8 +190,10 @@ mock 接受 `user_goodkey`(成功)/ `user_failkey`(403 测故障转移)/ `user_n
 | 对话报 `401 MISSING_CREDENTIAL` | 还没完成 OAuth 登录,先到控制台「发起登录」 |
 | 模型列表为空 | 目录来自 `https://api.commandcode.ai/provider/v1/models`(免鉴权),检查网络;日志会告警并 15 分钟后重试 |
 | 「重新连接 / 超时」 | 桥没在运行(关窗即停);或请求体超过 8MB 上限 |
+| 启动打印「监听地址不是回环地址」告警 | 你用了 `--host 0.0.0.0` 之类,管理面已对网络暴露,且该地址已写回 `config.json`。仅本机使用请改回 `--host 127.0.0.1`;确需局域网共享请在前面加带鉴权的反向代理 |
+| 控制台 CONFIG 区显示「非回环来源,已隐去」 | 说明你是从非回环地址打开控制台的。`/api/status` 只对回环来源下发 `apiKey`;请在运行桥的机器上访问 `http://127.0.0.1:<port>/` |
 | 控制台打不开或全是 403 | 用域名(反向代理 / hosts 别名)访问管理面时,把该域名加进 `config.json` 的 `allowedHosts` 再重启;日志会打印被拒的 `host` | 
-| 连不上 11435(端口变了) | 检查 `~/.cmdgo-bridge/config.json` 的 `port`(`--port` 启动会写回并持久化) | 
+| 连不上 11435(端口变了) | 检查 `~/.cmdgo-bridge/config.json` 的 `port`(`--port` 启动会写回并持久化);`--host` 同样会写回,所以一次 `--host 0.0.0.0` 会跨重启持续生效 | 
 | 控制台登录后收不到回调 | 回调服务器绑定 `127.0.0.1:5959..5968`;浏览器与宿主不同机时需端口转发/SSH 隧道 |
 | 想排查问题 | 每次请求都记录在启动窗口与 `~/.cmdgo-bridge/access.log`(方法/路径/状态码/耗时),聊天另有 model/账号/结果明细 |
 
