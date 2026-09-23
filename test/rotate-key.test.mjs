@@ -176,7 +176,7 @@ test('a non-loopback caller cannot rotate the token', async () => {
     assert.equal(JSON.parse(await readFile(join(spoofDir, 'config.json'), 'utf8').catch(() => '{"apiKey":"' + OLD_TOKEN + '"}')).apiKey, OLD_TOKEN)
   } finally {
     await new Promise((resolve) => spoofed.close(resolve))
-    await rm(spoofDir, { recursive: true, force: true })
+    await removeDataDir(spoofDir, { pool: bridgeState?.pool })
     globalThis.fetch = stubCatalog
   }
 })

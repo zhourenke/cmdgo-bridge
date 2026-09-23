@@ -105,9 +105,10 @@ const chatBody = (extra) => ({
 
 /* ---------------- F-07: max_tokens validation ---------------- */
 
-// `1e9` is NOT in this list: it is a safe integer, so it is a legal (if unwise)
-// limit and the bridge forwards it. Only values that cannot be a token count —
-// wrong type, non-integral, zero or negative — are refused.
+// `1e9` is NOT in this list: it is a safe integer, so type validation accepts it
+// as a legal (if unwise) token count. F-27 then refuses it for a different
+// reason — it cannot fit the model's context window — which is covered below and
+// in `context-window.test.mjs`.
 for (const bad of [0, -1, 1.5, '100', true, [], {}, '0']) {
   test(`max_tokens ${JSON.stringify(bad)} is refused with 400 instead of silently ignored`, async () => {
     const bridge = await boot('healthy')
@@ -126,15 +127,24 @@ for (const bad of [0, -1, 1.5, '100', true, [], {}, '0']) {
   })
 }
 
-test('a very large but valid max_tokens is forwarded rather than rejected', async () => {
-  // The boundary the validation must NOT cross: `1e9` is a safe integer, so it
-  // is a legal token count even though the model will never honour it. Rejecting
-  // it would break callers that use a big sentinel to mean "as long as possible".
+test('a very large but well-typed max_tokens fails the context check, not type validation', async () => {
+  // This assertion changed meaning when F-27 landed, deliberately. Emitting a huge
+  // sentinel used to be forwarded to the gateway, which refused it with a message
+  // the bridge could only classify by regex. It is now refused up front — but the
+  // distinction still matters: `1e9` is a VALID token count (a safe integer), so
+  // the error must be `context_length_exceeded`, never the `positive integer`
+  // complaint reserved for values that cannot be a count at all. A caller seeing
+  // the wrong one would conclude the bridge cannot parse its request.
   const bridge = await boot('healthy')
   try {
     const res = await bridge.chat(chatBody({ max_tokens: 1e9 }))
-    assert.equal(res.status, 200, res.body.slice(0, 200))
-    assert.equal(bridge.upstream.requests, 1)
+    assert.equal(res.status, 400, res.body.slice(0, 200))
+    const payload = JSON.parse(res.body)
+    assert.equal(payload.error.code, 'context_length_exceeded')
+    assert.equal(payload.error.param, 'max_tokens')
+    assert.doesNotMatch(payload.error.message, /positive integer/,
+      '1e9 is a legal token count; only the window makes it unusable')
+    assert.equal(bridge.upstream.requests, 0, 'the window is known locally, so no round trip is needed')
   } finally {
     await bridge.close()
   }

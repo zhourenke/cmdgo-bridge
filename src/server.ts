@@ -692,6 +692,37 @@ export function createBridgeServer(state: BridgeState): Server {
     req.once('end', close)
   }
 
+  /**
+   * Rejects a `max_tokens` the requested model's context window cannot hold.
+   *
+   * The gateway would refuse this anyway, but only after a round trip, and the
+   * bridge would have to CLASSIFY the refusal by pattern-matching the error text
+   * (`/context|token limit|too many tokens/i`) — if the gateway ever rephrases it,
+   * or answers in another language, the client gets a generic 400 it cannot act
+   * on. The capacity is already here: `/v1/models` publishes it as
+   * `context_length`, so validating against it just uses the metadata the bridge
+   * was already handing out.
+   *
+   * An unknown model (not in the catalog) is compared against
+   * `cfg.defaultContextWindow` instead. That floor is deliberate: the catalog is
+   * a filtered view, `/v1/chat/completions` accepts ids outside it, and a smaller
+   * real window would make this a false rejection of a request that works — the
+   * one outcome worse than a late error.
+   */
+  function assertMaxTokensFitsContext(chat: ChatRequest): void {
+    if (chat.maxTokens === undefined) return
+    const known = models().find(m => m.id === chat.model)
+    const window = known?.contextWindow ?? cfg.defaultContextWindow
+    if (chat.maxTokens <= window) return
+    throw new ClientError(
+      `"max_tokens" (${chat.maxTokens}) exceeds the context window of ${chat.model} (${window})` +
+        `${known === undefined ? '; model not in the catalog, compared against defaultContextWindow' : ''}`,
+      400,
+      'max_tokens',
+      'context_length_exceeded',
+    )
+  }
+
   async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     let body: Record<string, unknown>
     let chat: ChatRequest
@@ -702,6 +733,7 @@ export function createBridgeServer(state: BridgeState): Server {
     try {
       body = await readBody(req)
       chat = await parseChatRequest(body, { imageLimits: cfg.images, signal: controller.signal })
+      assertMaxTokensFitsContext(chat)
     } catch (error) {
       const message = error instanceof ClientError ? error.message : 'invalid request'
       const status = error instanceof ClientError ? error.httpStatus : 400

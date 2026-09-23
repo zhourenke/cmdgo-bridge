@@ -34,6 +34,18 @@ Command Code 的订阅分两种:标准 Provider API(OpenAI 兼容,任何工具�
 以下字段会被忽略但**不报错**(只影响回答内容、不改变回答结构,或本桥行为已满足):
 `stream_options`(本桥在干净结束的流上**总是**发 usage,已覆盖 `include_usage: true`)、`seed`、`logprobs` / `top_logprobs`、`presence_penalty`、`frequency_penalty`、`logit_bias`、`user`。
 
+### `max_tokens` 与模型上下文窗口
+
+`max_tokens`(或 `max_completion_tokens`)**超过该模型的上下文窗口**时返回 400:
+
+```json
+{"error":{"message":"\"max_tokens\" (200000) exceeds the context window of xiaomi/mimo-v2.6-flash (163840)","type":"invalid_request_error","code":"context_length_exceeded","param":"max_tokens"}}
+```
+
+窗口取自 `/v1/models` 的 `context_length`(上游清单里的真实值,缺失时用 `defaultContextWindow`)。**模型不在目录里**时按 `defaultContextWindow` 比较——目录只是过滤后的视图,`/v1/chat/completions` 接受目录外的 model id,用更小的值判断会把本来能用的请求拒掉。
+
+这条校验是**行为变更**(2026-09 修复批次):此前 `max_tokens: 1e9` 会被原样透传给上游、由一个措辞不定的上游错误结束,本桥只能靠正则猜那是"上下文超限"。现在在下发前就拒掉,`error.param` 与 `code` 都明确,便于下游自动收缩重试。缺省 `max_tokens` 不受影响。
+
 ## 界面预览
 
 ![控制台](assets/console.png)

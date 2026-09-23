@@ -76,13 +76,36 @@ function callOn(port, path, { method = 'GET', headers = {} } = {}) {
   })
 }
 
+/**
+ * Every pool this file has booted, so teardown can drain pending writes.
+ *
+ * The pool persists asynchronously through temp-file renames. Deleting a data
+ * directory while one is in flight fails with ENOTEMPTY (the temp file reappears
+ * mid-delete) and leaves the directory behind for the next run, so the queue is
+ * drained first. A registry rather than a single variable because each test boots
+ * its own bridge and several run against the same directory.
+ */
+const bootedPools = []
+
+/**
+ * Removes a temp directory without racing a pending manifest write.
+ * @param {string} dir
+ */
+async function removeDir(dir) {
+  await Promise.all(bootedPools.map((pool) => pool.flush().catch(() => {})))
+  await rm(dir, { recursive: true, force: true, maxRetries: 5 }).catch(() => {})
+}
+
 async function boot(dir, cfg = {}) {
   globalThis.fetch = stubCatalog
   const config = { ...defaultConfig(), host: '0.0.0.0', port: 0, ...cfg }
-  const server = createBridgeServer(buildState(config, dir))
+  const state = buildState(config, dir)
+  bootedPools.push(state.pool)
+  const server = createBridgeServer(state)
   await new Promise((resolve) => server.once('listening', resolve))
   return {
     port: server.address().port,
+    state,
     close: async () => {
       globalThis.fetch = realFetch
       await new Promise((resolve) => server.close(resolve))
@@ -111,7 +134,7 @@ test('readJsonObject tolerates a BOM and distinguishes missing from broken', asy
   const array = join(dir, 'array.json')
   await writeFile(array, '[1,2]', 'utf8')
   await assert.rejects(() => readJsonObject(array), /顶层不是 JSON 对象/)
-  await rm(dir, { recursive: true, force: true })
+  await removeDir(dir)
 })
 
 /* ---------------- config.json ---------------- */
@@ -132,7 +155,7 @@ test('a BOM-prefixed config.json keeps its client API key', async () => {
   assert.deepEqual(warnings, [], 'a BOM is not a corruption and must not warn')
   const entries = await readdir(dir)
   assert.ok(!entries.some((name) => name.includes('.corrupt-')), `nothing should be moved aside: ${entries.join(', ')}`)
-  await rm(dir, { recursive: true, force: true })
+  await removeDir(dir)
 })
 
 test('a genuinely corrupt config is set aside and the key change is announced', async () => {
@@ -151,7 +174,7 @@ test('a genuinely corrupt config is set aside and the key change is announced', 
   const text = warnings.join('\n')
   assert.match(text, /config\.json 无法解析/)
   assert.match(text, /API key 已重新随机生成/, 'the operator must be told downstream clients will need the new key')
-  await rm(dir, { recursive: true, force: true })
+  await removeDir(dir)
 })
 
 /* ---------------- credentials.json ---------------- */
@@ -169,7 +192,7 @@ test('a BOM-prefixed credentials.json still resolves its keys', async () => {
   assert.equal((await creds.describe('REF_B')).configured, true)
   assert.equal(creds.diagnose().error, undefined, 'a BOM is not a corruption')
   assert.deepEqual(warnings, [])
-  await rm(dir, { recursive: true, force: true })
+  await removeDir(dir)
 })
 
 test('an unparseable credentials.json reports itself instead of looking empty', async () => {
@@ -186,7 +209,7 @@ test('an unparseable credentials.json reports itself instead of looking empty', 
   // The file must be left alone so the operator can repair it.
   const onDisk = await readFile(join(dir, 'credentials.json'), 'utf8')
   assert.match(onDisk, /REF_A/, 'the damaged file must not be deleted or rewritten')
-  await rm(dir, { recursive: true, force: true })
+  await removeDir(dir)
 })
 
 test('invalidate() makes a repaired credentials.json take effect', async () => {
@@ -202,7 +225,7 @@ test('invalidate() makes a repaired credentials.json take effect', async () => {
 
   assert.equal((await creds.resolve('REF_A')).value, 'sk-fixed', 'the repair must be picked up')
   assert.equal(creds.diagnose().error, undefined, 'and the warning must clear')
-  await rm(dir, { recursive: true, force: true })
+  await removeDir(dir)
 })
 
 /* ---------------- accounts.json ---------------- */
@@ -217,7 +240,7 @@ test('a BOM-prefixed accounts.json keeps the account list', async () => {
   const accounts = await pool.list()
   assert.deepEqual(accounts.map(a => a.id), ['a', 'b'], 'a BOM must not empty the pool')
   assert.equal(pool.activeCount(), 2)
-  await rm(dir, { recursive: true, force: true })
+  await removeDir(dir)
 })
 
 test('a corrupt accounts.json fails loudly rather than starting empty', async () => {
@@ -231,7 +254,7 @@ test('a corrupt accounts.json fails loudly rather than starting empty', async ()
     assert.match(error.message, /覆盖/, 'the message must explain why it refuses to continue')
     return true
   }, 'an empty pool and a corrupt one must not be conflated')
-  await rm(dir, { recursive: true, force: true })
+  await removeDir(dir)
 })
 
 test('reload() picks up a manifest that appeared after the first load', async () => {
@@ -242,7 +265,7 @@ test('reload() picks up a manifest that appeared after the first load', async ()
   await writeBom(join(dir, 'accounts.json'), JSON.stringify({ version: 1, accounts: [account('late')] }))
   assert.deepEqual((await pool.reload()).map(a => a.id), ['late'], 'reload must see the new file')
   assert.equal(pool.activeCount(), 1)
-  await rm(dir, { recursive: true, force: true })
+  await removeDir(dir)
 })
 
 test('a rejected load is not cached, so a repair can be retried', async () => {
@@ -253,7 +276,7 @@ test('a rejected load is not cached, so a repair can be retried', async () => {
   await assert.rejects(() => pool.list())
   await writeFile(path, JSON.stringify({ version: 1, accounts: [account('fixed')] }), 'utf8')
   assert.deepEqual((await pool.list()).map(a => a.id), ['fixed'], 'the first failure must not poison later reads')
-  await rm(dir, { recursive: true, force: true })
+  await removeDir(dir)
 })
 
 /* ---------------- end to end ---------------- */
@@ -278,7 +301,7 @@ test('the whole bridge starts from BOM-prefixed state files', async () => {
     assert.equal(status.accounts[0].configured, true, 'the credential must resolve')
   } finally {
     await bridge.close()
-    await rm(dir, { recursive: true, force: true })
+    await removeDir(dir)
   }
 })
 
@@ -294,7 +317,7 @@ test('/api/status names the broken file when credentials.json cannot be parsed',
     assert.match(status.storageWarning ?? '', /缺少凭据/, 'and must flag the affected account')
   } finally {
     await bridge.close()
-    await rm(dir, { recursive: true, force: true })
+    await removeDir(dir)
   }
 })
 
@@ -325,7 +348,7 @@ test('POST /api/reload restores service after a hand repair, without a restart',
     assert.equal(after.accounts[0].configured, true, 'the account is usable again')
   } finally {
     await bridge.close()
-    await rm(dir, { recursive: true, force: true })
+    await removeDir(dir)
   }
 })
 
@@ -342,7 +365,7 @@ test('POST /api/reload reports a still-broken accounts.json instead of emptying 
     assert.equal(onDisk, '{ broken', 'the broken manifest must be left untouched')
   } finally {
     await bridge.close()
-    await rm(dir, { recursive: true, force: true })
+    await removeDir(dir)
   }
 })
 
@@ -366,6 +389,6 @@ test('a reload discovers an account added by hand while running', async () => {
     assert.equal(JSON.parse((await callOn(bridge.port, '/api/status')).body).activeAccounts, 2)
   } finally {
     await bridge.close()
-    await rm(dir, { recursive: true, force: true })
+    await removeDir(dir)
   }
 })
