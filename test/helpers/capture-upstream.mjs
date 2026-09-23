@@ -35,6 +35,15 @@ export async function startCapturingUpstream(options = {}) {
   const envelopes = []
   const headers = []
   const server = createServer(async (req, res) => {
+    // Tell the client's keep-alive pool not to hold this connection.
+    //
+    // A stub lives for one test and is then closed. Any socket the pool keeps
+    // cached afterwards points at a server that no longer exists, and the NEXT
+    // test's request can be handed that dead socket — surfacing as an
+    // intermittent `fetch failed` inside the bridge, blamed on the bridge. It
+    // cannot be cleared from here: the pool belongs to the test process. So the
+    // server says `Connection: close` and no socket is ever cached.
+    res.setHeader('Connection', 'close')
     let raw = ''
     req.setEncoding('utf8')
     for await (const chunk of req) raw += chunk

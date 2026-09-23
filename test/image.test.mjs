@@ -173,9 +173,17 @@ test('refuses a private image URL without any network access', async () => {
     () => fetchImage('http://127.0.0.1:11435/v1/models', limits()),
     /private address/,
   )
+  // 169.254.0.0/16 is link-local, and the refusal now says so specifically instead
+  // of lumping it in with RFC1918 ranges. The narrower reason matters: it is the
+  // cloud metadata range, and it stays blocked even with allowPrivateNetwork on.
   await assert.rejects(
     () => fetchImage('http://169.254.169.254/latest/meta-data/', limits()),
+    /link-local address/,
+  )
+  await assert.rejects(
+    () => fetchImage('http://10.1.2.3/x.png', limits()),
     /private address/,
+    'a plain RFC1918 host must still be refused as private',
   )
 })
 

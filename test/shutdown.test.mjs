@@ -79,7 +79,11 @@ function call(port, path, { method = 'GET', body } = {}) {
     }, (res) => {
       const chunks = []
       res.on('data', (c) => chunks.push(c))
-      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+      const finish = () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') })
+      res.on('end', finish)
+      // resolve on close too, so a truncated body fails an assertion instead of
+      // leaving the request pending until the runner's timeout
+      res.on('close', finish)
     })
     req.on('error', reject)
     req.end(payload)

@@ -282,11 +282,113 @@ export function isPrivateAddress(address: string): boolean {
   return false
 }
 
-async function assertPublicHost(hostname: string, limits: ImageLimits): Promise<void> {
-  if (limits.allowPrivateNetwork) return
-  if (isPrivateAddress(hostname)) {
-    throw new ImageError(`image URL host "${hostname}" is a private address`)
+/**
+ * True for link-local addresses, which are refused even when
+ * `allowPrivateNetwork` is on (F-29).
+ *
+ * `allowPrivateNetwork` existed to reach an internal image host, but its
+ * implementation returned from `assertPublicHost` before ANY check ran — so
+ * turning it on also re-opened `169.254.169.254`, the cloud metadata service that
+ * hands out instance credentials. On a cloud host that is the single most valuable
+ * SSRF target there is, and the README described the switch only as "allow private
+ * image addresses", which no operator would read as "allow the metadata endpoint".
+ *
+ * Link-local is a much narrower thing to keep blocked than private ranges: an image
+ * host on `10.x` or `192.168.x` is plausible, one on `169.254.x` is not (the range
+ * is not routable off-link), so the people who need the switch are not hurt by this.
+ *
+ * A blind SSRF is still an SSRF: the bridge would only surface image bytes, but the
+ * request itself reaches the endpoint, which is enough to probe or to trigger
+ * unauthenticated state-changing handlers.
+ *
+ * @param address IPv4 or IPv6 literal
+ */
+export function isLinkLocalAddress(address: string): boolean {
+  const version = isIP(address)
+  if (version === 4) {
+    const [a = -1, b = -1] = address.split('.').map(Number)
+    return a === 169 && b === 254
   }
+  if (version === 6) {
+    const lower = address.toLowerCase().replace(/^\[|\]$/g, '')
+    // Split an IPv4 tail off first: `::ffff:169.254.169.254` is a metadata URL
+    // wearing an IPv6 costume, and the first-hextet test below cannot see it.
+    const v4Tail = /(?:^|:)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(lower)
+    if (v4Tail?.[1] !== undefined) return isLinkLocalAddress(v4Tail[1])
+    // Other mapped forms: ::ffff:a9fe:a9fe, ::a9fe:a9fe — compare the last 32 bits.
+    const mapped = /(?:^|:)0*:?([0-9a-f]{0,4}):([0-9a-f]{1,4})$/.exec(lower)
+    if (mapped !== null && (lower.startsWith('::ffff:') || lower.startsWith('::'))) {
+      const high = Number.parseInt(mapped[1] === undefined || mapped[1] === '' ? '0' : mapped[1], 16)
+      const low = Number.parseInt(mapped[2] ?? '0', 16)
+      // 169.254.0.0/16 is a9fe:0000/16 in hex.
+      if (high === 0xa9fe && low >= 0 && low <= 0xffff) return true
+    }
+    // fe80::/10 covers the first hextet range 0xfe80–0xfebf.
+    const first = /^([0-9a-f]{1,4})/.exec(lower)?.[1]
+    if (first !== undefined) {
+      const value = Number.parseInt(first, 16)
+      if (value >= 0xfe80 && value <= 0xfebf) return true
+    }
+    return false
+  }
+  return false
+}
+
+/**
+ * The reason a hostname's own literal form must be refused, or `undefined`.
+ *
+ * Split out from `assertPublicHost` so the decision can be tested without a network
+ * or a resolver: what a resolver hands back for a given name is environment-specific
+ * (a corporate DNS may map `metadata.google.internal` into the RFC2544 range rather
+ * than to the real metadata address), while the policy itself must not be.
+ *
+ * @param hostname host as written in the URL
+ * @param allowPrivateNetwork operator switch that permits RFC1918 / ULA targets
+ */
+export function rejectionForLiteral(hostname: string, allowPrivateNetwork: boolean): string | undefined {
+  // Link-local is checked FIRST and outside the switch: the switch exists to reach
+  // an internal image host, not to re-open the cloud metadata service (F-29).
+  if (isLinkLocalAddress(hostname)) {
+    return `image URL host "${hostname}" is a link-local address (cloud metadata endpoints live there and stay blocked even with allowPrivateNetwork)`
+  }
+  if (!allowPrivateNetwork && isPrivateAddress(hostname)) {
+    return `image URL host "${hostname}" is a private address`
+  }
+  return undefined
+}
+
+/**
+ * The reason any resolved address must be refused, or `undefined`.
+ *
+ * The link-local test runs first and regardless of the switch. It also has to run at
+ * all in both modes: a NAME that resolves to the metadata service is a metadata
+ * request, and no literal check can see it.
+ *
+ * @param hostname host as written in the URL, used in the message
+ * @param addresses every address the name resolved to
+ * @param allowPrivateNetwork operator switch that permits RFC1918 / ULA targets
+ */
+export function rejectionForResolved(
+  hostname: string,
+  addresses: readonly string[],
+  allowPrivateNetwork: boolean,
+): string | undefined {
+  for (const address of addresses) {
+    if (isLinkLocalAddress(address)) {
+      return `image URL host "${hostname}" resolves to a link-local address (cloud metadata endpoints stay blocked even with allowPrivateNetwork)`
+    }
+    if (!allowPrivateNetwork && isPrivateAddress(address)) {
+      return `image URL host "${hostname}" resolves to a private address`
+    }
+  }
+  return undefined
+}
+
+async function assertPublicHost(hostname: string, limits: ImageLimits): Promise<void> {
+  const allowPrivateNetwork = limits.allowPrivateNetwork === true
+  const literal = rejectionForLiteral(hostname, allowPrivateNetwork)
+  if (literal !== undefined) throw new ImageError(literal)
+
   let addresses: { address: string }[]
   try {
     addresses = await lookup(hostname, { all: true })
@@ -294,11 +396,11 @@ async function assertPublicHost(hostname: string, limits: ImageLimits): Promise<
     throw new ImageError(`image URL host "${hostname}" does not resolve`)
   }
   if (addresses.length === 0) throw new ImageError(`image URL host "${hostname}" does not resolve`)
-  for (const { address } of addresses) {
-    if (isPrivateAddress(address)) {
-      throw new ImageError(`image URL host "${hostname}" resolves to a private address`)
-    }
-  }
+  // The lookup runs in both modes even though the switch short-circuits the private
+  // test: the link-local test below must still see what the name resolves to. That
+  // costs one DNS query per remote image fetch, which the fetch would do anyway.
+  const resolved = rejectionForResolved(hostname, addresses.map((entry) => entry.address), allowPrivateNetwork)
+  if (resolved !== undefined) throw new ImageError(resolved)
 }
 
 /**

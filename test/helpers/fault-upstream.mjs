@@ -132,6 +132,20 @@ export async function startFaultUpstream(scenario = 'die-mid-stream') {
     handler(res, (obj) => res.write(`${JSON.stringify(obj)}\n`))
   })
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  // Retire idle keep-alive sockets the moment a response finishes.
+  //
+  // A stub lives for one test and is then closed. A socket the client's pool keeps
+  // cached afterwards points at a server that no longer exists, and the NEXT test's
+  // request can be handed that dead socket — surfacing as an intermittent
+  // `fetch failed` inside the bridge, blamed on the bridge. The pool belongs to the
+  // test process and cannot be cleared from here, so the sockets are retired
+  // instead. `Connection: close` would do that too, but it also changes what a
+  // mid-stream destroy looks like: the FIN turns the truncation into a clean EOF
+  // and `die-mid-stream` stops being a failure at all. A 1 ms keep-alive timeout
+  // leaves the teardown semantics alone.
+  server.keepAliveTimeout = 1
+  server.headersTimeout = 60_000
+  server.requestTimeout = 60_000
   const { port } = server.address()
   return {
     baseURL: `http://127.0.0.1:${port}`,

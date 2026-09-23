@@ -88,8 +88,13 @@ function post(port, path, payload) {
       },
     }, (res) => {
       const chunks = []
+      const finish = () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') })
       res.on('data', (c) => chunks.push(c))
-      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+      res.on('end', finish)
+      // `end` is the normal path. `close` without `end` means the peer went away
+      // mid-response; resolving with what arrived lets the assertion report the
+      // truncation instead of the test hanging until the runner's timeout.
+      res.on('close', finish)
     })
     req.on('error', reject)
     req.end(body)
