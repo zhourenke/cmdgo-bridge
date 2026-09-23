@@ -7,7 +7,7 @@
 
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
-import { appendFile } from 'node:fs/promises'
+import { appendFile, rename, stat } from 'node:fs/promises'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -125,6 +125,7 @@ const WRITE_BUFFER_HIGH_WATER = 1 << 20
  * `closeAfterOversize`.
  */
 const OVERSIZE_CLOSE_TIMEOUT_MS = 3_000
+
 /**
  * 访问/聊天日志落盘：无论桥由谁启动(控制台 vs 双击脚本)都可追溯。
  * Follows the configured data directory so a `--data-dir` run does not scatter
@@ -132,9 +133,54 @@ const OVERSIZE_CLOSE_TIMEOUT_MS = 3_000
  */
 let accessLogFile = join(DEFAULT_DATA_DIR, 'access.log')
 
+/** Rotate once the live log passes this size; keep {@link LOG_KEEP} old files. */
+const LOG_MAX_BYTES = 5 * 1024 * 1024
+const LOG_KEEP = 3
+
+/**
+ * Current log size, tracked in memory so the hot path does not `stat` per line.
+ * `undefined` means "not measured yet" — the first append measures it.
+ */
+let accessLogBytes: number | undefined
+/** Set once a log write has failed, to warn about it exactly once. */
+let logFailureReported = false
+/** Serializes rotation against appends so two lines cannot interleave a rename. */
+let logQueue: Promise<void> = Promise.resolve()
+
 function logLine(line: string): void {
   console.log(line)
-  void appendFile(accessLogFile, `${line}\n`).catch(() => {})
+  logQueue = logQueue.then(async () => {
+    try {
+      if (accessLogBytes === undefined) {
+        accessLogBytes = await stat(accessLogFile).then(s => s.size, () => 0)
+      }
+      // Rotation is checked per write rather than on a timer: the size is already
+      // known here, and a long-idle bridge should not wake up just to rotate.
+      if (accessLogBytes >= LOG_MAX_BYTES) {
+        // Shift `access.log.2` -> `.3`, `.1` -> `.2`, `access.log` -> `.1`, oldest
+        // discarded. `rename` is atomic per file, and the queue keeps an append
+        // from landing in a file mid-shift.
+        for (let i = LOG_KEEP - 1; i >= 1; i--) {
+          await rename(`${accessLogFile}.${i}`, `${accessLogFile}.${i + 1}`).catch(() => {})
+        }
+        await rename(accessLogFile, `${accessLogFile}.1`).catch(() => {})
+        accessLogBytes = 0
+      }
+      await appendFile(accessLogFile, `${line}\n`)
+      accessLogBytes += Buffer.byteLength(line) + 1
+      logFailureReported = false
+    } catch (error) {
+      // A swallowed log failure means logging stops SILENTLY — the operator sees
+      // a quiet bridge and assumes there was no traffic. Say it on stderr (which
+      // survives a redirected stdout) once per failure streak, not once per line.
+      if (!logFailureReported) {
+        logFailureReported = true
+        process.stderr.write(
+          `[cmdgo] 访问日志写入失败：${accessLogFile} — ${error instanceof Error ? error.message : String(error)}\n`,
+        )
+      }
+    }
+  })
 }
 
 function json(res: ServerResponse, statusCode: number, body: unknown): void {
@@ -332,6 +378,8 @@ export function waitForDrain(
 export function createBridgeServer(state: BridgeState): Server {
   const { cfg, credentials, pool, login } = state
   accessLogFile = join(state.dataDir, 'access.log')
+  // The size cache belongs to the previous file; re-measure this one lazily.
+  accessLogBytes = undefined
   const limits: ServerLimits = {
     maxConcurrentChats: MAX_CONCURRENT_CHATS,
     writeBufferHighWater: WRITE_BUFFER_HIGH_WATER,
@@ -341,6 +389,41 @@ export function createBridgeServer(state: BridgeState): Server {
 
   /** Chat completions currently running, across every account. */
   let chatInFlight = 0
+
+  /**
+   * Completed chat latencies, in milliseconds, for `/health`.
+   *
+   * A fixed ring: this is a liveness signal for an operator, not a metrics
+   * system, and an unbounded array in a process that may run for months is a leak
+   * that only shows up when it matters. Percentiles over the recent window answer
+   * the question actually being asked ("is it slow right now?").
+   */
+  const LATENCY_WINDOW = 512
+  const chatLatencies: number[] = []
+  let chatLatencyCursor = 0
+  /** Chat outcomes since start, for `/health`. */
+  let chatOk = 0
+  let chatFailed = 0
+
+  function recordChat(outcome: 'ok' | 'error', durationMs: number): void {
+    if (outcome === 'ok') chatOk += 1
+    else chatFailed += 1
+    if (chatLatencies.length < LATENCY_WINDOW) {
+      chatLatencies.push(durationMs)
+      return
+    }
+    chatLatencies[chatLatencyCursor] = durationMs
+    chatLatencyCursor = (chatLatencyCursor + 1) % LATENCY_WINDOW
+  }
+
+  /** Nearest-rank percentiles over the recent window; `{}` when nothing ran yet. */
+  function latencyPercentiles(): Record<string, number> {
+    if (chatLatencies.length === 0) return {}
+    const sorted = [...chatLatencies].sort((a, b) => a - b)
+    const at = (fraction: number): number =>
+      sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))] ?? 0
+    return { p50: at(0.5), p95: at(0.95), p99: at(0.99), samples: sorted.length }
+  }
 
   /**
    * Reserves a concurrency slot for one chat completion.
@@ -423,6 +506,20 @@ export function createBridgeServer(state: BridgeState): Server {
     return started
   }
 
+  /** One account as the console and `/health` see it. No key material. */
+  interface AccountRow {
+    id: string
+    ref: string
+    userName?: string
+    keyName?: string
+    addedAt: number
+    enabled: boolean
+    failCount: number
+    cooling: boolean
+    lastError?: string
+    configured: boolean
+  }
+
   interface StatusSnapshot {
     ok: boolean
     provider: string
@@ -435,7 +532,7 @@ export function createBridgeServer(state: BridgeState): Server {
     modelIds: string[]
     login: LoginStatus
     activeAccounts: number
-    accounts: unknown[]
+    accounts: AccountRow[]
     /** Parse failures on the on-disk state files; absent when both are usable. */
     storageWarning?: string
   }
@@ -627,6 +724,10 @@ export function createBridgeServer(state: BridgeState): Server {
       },
     }
     const logOutcome = (outcome: string, detail = ''): void => {
+      // `ok` and `ok-no-finish-step` are successes; everything else is a failure.
+      // Recording here rather than at each return means the counters cannot drift
+      // away from the log an operator reads next to them.
+      recordChat(outcome.startsWith('ok') ? 'ok' : 'error', Date.now() - startedAt)
       logLine(`[cmdgo] chat 结束 model=${chat.model} stream=${chat.stream} ${outcome} ${Date.now() - startedAt}ms${detail ? ` ${detail}` : ''}`)
     }
 
@@ -1020,6 +1121,18 @@ export function createBridgeServer(state: BridgeState): Server {
           // by the plan or the accounts.
           chatInFlight,
           chatCapacity: limits.maxConcurrentChats,
+          // Account health and throughput, in the shape an operator needs to tell
+          // "my keys are cooling down" from "the plan is throttling me" from "the
+          // bridge itself is failing". Deliberately counters only: no account ids,
+          // no key names, no lastError strings — `/health` is unauthenticated.
+          chats: { ok: chatOk, failed: chatFailed, latencyMs: latencyPercentiles() },
+          pool: {
+            total: snapshot.accounts.length,
+            enabled: snapshot.accounts.filter(a => a.enabled).length,
+            available: snapshot.activeAccounts,
+            cooling: snapshot.accounts.filter(a => a.enabled && a.cooling).length,
+            failing: snapshot.accounts.filter(a => a.failCount > 0).length,
+          },
         })
         return
       }
