@@ -133,6 +133,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 | `GET /api/status` | 无鉴权 | 登录 / 账号 / 模型状态快照;**仅回环来源**的响应包含 `apiKey` |
 | `POST /api/login` `cancel` `logout` | 无鉴权 | 登录生命周期 |
 | `POST /api/account/toggle` `remove` | 无鉴权 | 账号管理 |
+| `POST /api/reload` | 无鉴权，**仅回环来源** | 重新读取 `accounts.json` 与 `credentials.json`（手改文件后免重启；解析失败返回 500 并说明是哪个文件） |
 | `POST /api/rotate-key` | 无鉴权，**仅回环来源** | 轮换客户端 API key；返回新值，旧值**立即失效**，无需重启 |
 
 > **管理面（`/api/*`、`/health`、控制台页面）不携带 token**。它额外校验 `Origin` 同源与 `Host` 白名单:其它站点发起的**浏览器跨源请求**、以及把域名解析到回环地址的 DNS rebinding 都会被 403 拒绝。
@@ -166,7 +167,9 @@ node -e "const fs=require('fs'),crypto=require('crypto'),p=process.argv[1];const
 curl.exe -s -o NUL -w "new=%{http_code}`n" -H "Authorization: Bearer <新token>" http://127.0.0.1:11435/v1/models
 ```
 
-> 两种方式的区别：控制台轮换**不需要重启**（`authorized()` 每次请求都读当前配置），命令行方式**必须重启**。手改文件时务必用无 BOM 的 UTF-8 写入——带 BOM 会让桥把 `config.json` 当成损坏文件并**重新随机生成**一个 key（见排错表）。
+> 两种方式的区别：控制台轮换**不需要重启**（`authorized()` 每次请求都读当前配置），命令行方式**必须重启**。
+>
+> 手改文件用无 BOM 的 UTF-8 最稳妥，但**带 BOM 也不会再出问题**：三个状态文件（`config.json` / `credentials.json` / `accounts.json`）现在都会先剥掉 UTF-8 BOM 再解析。此前 BOM 会让 `config.json` 被判定为损坏并**静默重新随机生成**一个 key（所有下游 401，且日志不说明原因），也会让 `accounts.json` / `credentials.json` 读成"空"，进而被下一次写入覆盖掉——这也是控制台「轮换」按钮存在的原因。
 
 ## 图片输入
 
@@ -215,7 +218,10 @@ mock 接受 `user_goodkey`(成功)/ `user_failkey`(403 测故障转移)/ `user_n
 | --- | --- |
 | 启动报「端口已被占用」 | 已有实例在运行(可能上次的窗口没关),关掉旧窗口或用 `--port` 换端口 |
 | 对话报 `401 invalid_api_key` | Agent 工具里填的 key 与终端打印的不一致,去控制台 CONFIG 区复制 |
-| 对话报 `401 MISSING_CREDENTIAL` | 还没完成 OAuth 登录,先到控制台「发起登录」 |
+| 对话报 `401 MISSING_CREDENTIAL` | 还没完成 OAuth 登录,先到控制台「发起登录」;若之前用过、突然变成这样,看控制台是否提示「credentials.json 无法解析」——修好文件后点重载或 `POST /api/reload` |
+| 启动失败并提示「accounts.json 无法解析」 | 账号清单损坏。桥**故意拒绝启动**而不是用空账号池继续（否则下一次写入会覆盖掉你唯一的一份账号列表）。按提示修好或删除该文件后重启；原文件未被改动 |
+| 启动日志出现「config.json 无法解析…API key 已重新随机生成」 | 配置文件真的坏了（不是 BOM——BOM 现已自动兼容）。原文件已改名保留为 `config.json.corrupt-<时间戳>`；用控制台 CONFIG 区复制新 key 分发给下游 |
+| 手改了 `accounts.json` / `credentials.json` 但不生效 | 改动需要重载：控制台点重载，或 `curl -X POST http://127.0.0.1:11435/api/reload`（仅回环来源可调用）。运行中的桥以内存副本为准，直接手改会在下次写入时被覆盖 |
 | 模型列表为空 | 目录来自 `https://api.commandcode.ai/provider/v1/models`(免鉴权),检查网络;日志会告警并 15 分钟后重试 |
 | 「重新连接 / 超时」 | 桥没在运行(关窗即停);或请求体超过 8MB 上限 |
 | 启动打印「监听地址不是回环地址」告警 | 你用了 `--host 0.0.0.0` 之类,管理面已对网络暴露,且该地址已写回 `config.json`。仅本机使用请改回 `--host 127.0.0.1`;确需局域网共享请在前面加带鉴权的反向代理 |

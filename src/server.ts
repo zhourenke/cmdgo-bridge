@@ -59,6 +59,24 @@ export interface BridgeState {
   onError?: (error: NodeJS.ErrnoException) => void
 }
 
+/**
+ * Reads the optional diagnostics a credential store may expose.
+ *
+ * `CredentialsSeam` is the pool's minimal contract (resolve/describe/set/unset)
+ * and is stubbed in tests, so these are probed rather than required.
+ */
+function credentialsDiagnose(credentials: CredentialsSeam): string | undefined {
+  const diagnose = (credentials as { diagnose?: () => { error?: string } }).diagnose
+  if (typeof diagnose !== 'function') return undefined
+  return diagnose.call(credentials).error
+}
+
+/** Drops a credential store's cache when it supports reloading. */
+function credentialsInvalidate(credentials: CredentialsSeam): void {
+  const invalidate = (credentials as { invalidate?: () => void }).invalidate
+  if (typeof invalidate === 'function') invalidate.call(credentials)
+}
+
 const INDEX_FILE = join(fileURLToPath(new URL('.', import.meta.url)), '..', 'public', 'index.html')
 /**
  * 访问/聊天日志落盘：无论桥由谁启动(控制台 vs 双击脚本)都可追溯。
@@ -263,6 +281,8 @@ export function createBridgeServer(state: BridgeState): Server {
     login: LoginStatus
     activeAccounts: number
     accounts: unknown[]
+    /** Parse failures on the on-disk state files; absent when both are usable. */
+    storageWarning?: string
   }
 
   /**
@@ -295,6 +315,15 @@ export function createBridgeServer(state: BridgeState): Server {
       }
     }))
     const endpoint = `http://${cfg.host === '0.0.0.0' ? '127.0.0.1' : cfg.host}:${cfg.port}/v1`
+    // A credentials.json that failed to parse presents as "no account
+    // configured", which looks exactly like a fresh install. Surface the
+    // difference here so the console can say which file is broken. The seam
+    // intentionally does not carry this, so accept the optional extension.
+    const credentialProblem = credentialsDiagnose(credentials)
+    const missingKeys = rows.filter(row => row.configured !== true).map(row => row.id)
+    const warnings: string[] = []
+    if (credentialProblem !== undefined) warnings.push(`credentials.json 无法解析：${credentialProblem}`)
+    if (missingKeys.length > 0) warnings.push(`以下账号缺少凭据：${missingKeys.join(', ')}`)
     return {
       ok: true,
       provider: 'commandcode',
@@ -307,6 +336,7 @@ export function createBridgeServer(state: BridgeState): Server {
       login: login.status,
       activeAccounts: pool.activeCount(now),
       accounts: rows,
+      ...(warnings.length === 0 ? {} : { storageWarning: warnings.join('；') }),
     }
   }
 
@@ -564,6 +594,40 @@ export function createBridgeServer(state: BridgeState): Server {
       json(res, 200, { ok: true, removed })
       return
     }
+    if (req.method === 'POST' && action === '/reload') {
+      await readBody(req)
+      // Re-read accounts.json and credentials.json so an operator who just
+      // repaired a hand-edited file (or added an account out of band) does not
+      // have to restart. Restricted to loopback for the same reason rotation is:
+      // it can change which accounts the bridge will spend quota on.
+      if (!isLoopbackAddress(req.socket.remoteAddress)) {
+        logLine(`[cmdgo] 拒绝来自 ${req.socket.remoteAddress ?? '?'} 的 /api/reload（仅允许回环来源）`)
+        json(res, 403, { ok: false, error: '重载账号与凭据仅允许从本机（回环地址）发起' })
+        return
+      }
+      credentialsInvalidate(credentials)
+      let accounts: PoolAccount[]
+      try {
+        accounts = await pool.reload()
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        logLine(`[cmdgo] 重载 accounts.json 失败：${message}`)
+        json(res, 500, { ok: false, error: message })
+        return
+      }
+      // Touch credentials so a parse failure surfaces here rather than at the
+      // next chat request.
+      const credentialError = (await Promise.all(
+        accounts.map(async (account) => {
+          try { return (await credentials.describe(account.ref)).configured ? undefined : `${account.id}: 凭据缺失` } catch (error) {
+            return `${account.id}: ${error instanceof Error ? error.message : String(error)}`
+          }
+        }),
+      )).filter((entry): entry is string => entry !== undefined)
+      logLine(`[cmdgo] 已重载：账号 ${accounts.length} 个，启用 ${pool.activeCount()} 个${credentialError.length === 0 ? '' : `，其中 ${credentialError.length} 个凭据有问题`}`)
+      json(res, 200, { ok: true, accounts: accounts.length, active: pool.activeCount(), problems: credentialError })
+      return
+    }
     if (req.method === 'POST' && action === '/rotate-key') {
       await readBody(req)
       // Rotation changes the one credential `/v1/*` accepts, so it is restricted
@@ -747,12 +811,13 @@ export function createBridgeServer(state: BridgeState): Server {
 }
 
 export function buildState(cfg: ServerConfig, dataDir: string): BridgeState {
-  const credentials = new FileCredentials(dataDir)
+  const log = (m: string): void => console.log(`[cmdgo] ${m}`)
+  const credentials = new FileCredentials(dataDir, log)
   return {
     cfg,
     dataDir,
     credentials,
-    pool: new AccountPool({ baseRef: 'COMMANDCODE_API_KEY', dataDir, log: (m) => console.log(`[cmdgo] ${m}`) }),
-    login: new CommandCodeLoginManager((m) => console.log(`[cmdgo] ${m}`)),
+    pool: new AccountPool({ baseRef: 'COMMANDCODE_API_KEY', dataDir, log }),
+    login: new CommandCodeLoginManager(log),
   }
 }

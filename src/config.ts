@@ -75,13 +75,61 @@ function applyImageEnv(cfg: ServerConfig, env: NodeJS.ProcessEnv): void {
   }
 }
 
+/**
+ * Strips a UTF-8 byte-order mark.
+ *
+ * Hand-editing these files on Windows is a documented flow (see the rotation
+ * runbook), and Notepad and PowerShell's `>` / `Out-File` all prepend a BOM by
+ * default. `JSON.parse` rejects it, and every caller used to treat that as
+ * "corrupt", so a BOM silently cost the operator their config — including the
+ * client API key — with no message explaining why.
+ */
+export function stripBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text
+}
+
+/**
+ * Reads and parses a JSON object from disk, tolerating a BOM.
+ *
+ * Returns `undefined` when the file is absent. Throws with the path in the
+ * message for unreadable or unparseable content, so a caller can tell "not
+ * configured yet" apart from "misconfigured" instead of collapsing both into an
+ * empty object.
+ */
+export async function readJsonObject(path: string): Promise<Record<string, unknown> | undefined> {
+  let raw: string
+  try {
+    raw = await readFile(path, 'utf8')
+  } catch (error) {
+    if (isNotFound(error)) return undefined
+    throw new Error(`${path}: 读取失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+  let decoded: unknown
+  try {
+    decoded = JSON.parse(stripBom(raw))
+  } catch (error) {
+    throw new Error(`${path}: JSON 解析失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+  if (typeof decoded !== 'object' || decoded === null || Array.isArray(decoded)) {
+    throw new Error(`${path}: 顶层不是 JSON 对象（实际是 ${Array.isArray(decoded) ? 'array' : typeof decoded}）`)
+  }
+  return decoded as Record<string, unknown>
+}
+
+/** Whether an error is a filesystem "no such file" error. */
+export function isNotFound(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ENOENT'
+}
+
 export class ConfigStore {
   private readonly file: string
   private readonly dir: string
+  private readonly log: (message: string) => void
 
-  constructor(dataDir: string = DEFAULT_DATA_DIR) {
+  constructor(dataDir: string = DEFAULT_DATA_DIR, log: (message: string) => void = () => {}) {
     this.dir = dataDir
     this.file = join(dataDir, 'config.json')
+    this.log = log
   }
 
   get dataDir(): string {
@@ -98,25 +146,24 @@ export class ConfigStore {
   }
 
   private async readConfigFile(): Promise<ServerConfig> {
-    let raw: string
+    let parsed: Record<string, unknown>
     try {
-      raw = await readFile(this.file, 'utf8')
-    } catch {
-      // Absent (first run) or unreadable: start fresh with a new client key.
-      return defaultConfig()
-    }
-    let parsed: Partial<ServerConfig>
-    try {
-      const decoded: unknown = JSON.parse(raw)
-      if (typeof decoded !== 'object' || decoded === null || Array.isArray(decoded)) {
-        throw new Error('config root is not an object')
-      }
-      parsed = decoded as Partial<ServerConfig>
-    } catch {
-      // Preserve the unreadable file. The caller saves immediately after load,
-      // so returning defaults outright would silently discard baseURL and the
-      // client API key on a truncated write or a transient read error.
+      const decoded = await readJsonObject(this.file)
+      if (decoded === undefined) return defaultConfig()
+      parsed = decoded
+    } catch (error) {
+      // Genuinely unreadable (truncated write, transient read error). Preserve
+      // the bytes for forensics and start from defaults, exactly as before —
+      // but say so, because starting from defaults means a fresh client API key,
+      // and the operator's downstream tools will start failing with 401 for a
+      // reason nothing else in the logs explains. A BOM never reaches here:
+      // `readJsonObject` strips it, which is the case that used to bite.
       await rename(this.file, `${this.file}.corrupt-${Date.now()}`).catch(() => {})
+      this.log(
+        `[cmdgo] config.json 无法解析，已改名为 config.json.corrupt-<时间戳> 并改用默认配置：`
+        + `${error instanceof Error ? error.message : String(error)}\n`
+        + '[cmdgo] ⚠️ 客户端 API key 已重新随机生成，下游工具需要用新 key（控制台 CONFIG 区可复制）。',
+      )
       return defaultConfig()
     }
     const cfg = defaultConfig()

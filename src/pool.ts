@@ -13,9 +13,20 @@
  * @module cmdgo-bridge/pool
  */
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { randomBytes } from 'node:crypto'
+import { readJsonObject } from './config.js'
+
+/**
+ * The account manifest exists but cannot be parsed.
+ *
+ * Distinct from "no accounts yet": callers must not treat this as an empty
+ * pool, because persisting afterwards would overwrite the only copy.
+ */
+export class ManifestError extends Error {
+  override readonly name = 'ManifestError'
+}
 
 /** Credential store reference: a plain string naming an entry in the store. */
 export type CredentialRef = string
@@ -107,20 +118,54 @@ export class AccountPool {
     // caller through while `accounts` was still empty: `add()` would then
     // persist a manifest containing only its own account, wiping the rest.
     this.loadPromise ??= this.load()
+    // A rejected load must not be cached, or every later call re-throws the
+    // first failure and repairing the file could never take effect.
+    this.loadPromise.catch(() => { this.loadPromise = undefined })
     return this.loadPromise
   }
 
   private async load(): Promise<void> {
+    let parsed: Record<string, unknown> | undefined
     try {
-      const raw = await readFile(this.file, 'utf8')
-      const parsed = JSON.parse(raw) as Partial<Manifest>
-      if (Array.isArray(parsed.accounts)) {
-        this.accounts = parsed.accounts.filter((a): a is PoolAccount =>
-          typeof a?.id === 'string' && typeof a?.ref === 'string' && typeof a?.addedAt === 'number')
-      }
-    } catch (_missingOrCorrupt) {
-      this.accounts = []
+      parsed = await readJsonObject(this.file)
+    } catch (error) {
+      // Refuse to continue rather than start with an empty pool. An empty pool
+      // and a corrupt manifest look identical to every caller, and the first
+      // `add`/`toggle`/`reportFailure` would persist that emptiness over the
+      // operator's only copy of the account list. A BOM does not land here —
+      // `readJsonObject` strips it.
+      throw new ManifestError(
+        `accounts.json 无法解析：${error instanceof Error ? error.message : String(error)}\n`
+        + '  已停止加载以免用空账号池覆盖它。请修复或删除该文件后重启：\n'
+        + `    ${this.file}`,
+      )
     }
+    if (parsed === undefined) {
+      this.accounts = []
+      return
+    }
+    if (!Array.isArray(parsed.accounts)) {
+      this.accounts = []
+      return
+    }
+    this.accounts = parsed.accounts.filter((a): a is PoolAccount =>
+      typeof (a as PoolAccount)?.id === 'string'
+      && typeof (a as PoolAccount)?.ref === 'string'
+      && typeof (a as PoolAccount)?.addedAt === 'number')
+  }
+
+  /**
+   * Re-reads the manifest from disk, discarding the in-memory copy.
+   *
+   * Exposed through `POST /api/reload`: hand-editing `accounts.json` was
+   * previously inert until a restart, and the in-memory copy is authoritative
+   * afterwards, so an edit made while the bridge runs would be overwritten by
+   * the next mutation.
+   */
+  async reload(): Promise<PoolAccount[]> {
+    this.loadPromise = undefined
+    await this.ensureLoaded()
+    return this.list()
   }
 
   /**

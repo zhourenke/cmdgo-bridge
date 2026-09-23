@@ -53,7 +53,7 @@ http://127.0.0.1:<port>/ 使用控制台完成 OAuth 登录。`)
     return
   }
 
-  const store = new ConfigStore(args.dataDir ?? DEFAULT_DATA_DIR)
+  const store = new ConfigStore(args.dataDir ?? DEFAULT_DATA_DIR, (m) => console.log(m))
   const cfg = await store.load()
   if (args.host !== undefined) cfg.host = args.host
   if (args.port !== undefined) cfg.port = args.port
@@ -75,6 +75,15 @@ http://127.0.0.1:<port>/ 使用控制台完成 OAuth 登录。`)
   }
 
   const state = buildState(cfg, store.dataDir)
+  // Load the account manifest now rather than on the first chat request, so a
+  // corrupt accounts.json is reported at startup with a readable message instead
+  // of as an unhandled rejection from inside a request handler.
+  try {
+    await state.pool.ensureLoaded()
+  } catch (error) {
+    console.error(`[cmdgo] 启动失败：${error instanceof Error ? error.message : String(error)}`)
+    process.exit(1)
+  }
   state.onError = (error: NodeJS.ErrnoException) => {
     if (error.code === 'EADDRINUSE') {
       console.error(`[cmdgo] 端口 ${cfg.port} 已被占用；换端口：node dist/index.js --port <port>`)
