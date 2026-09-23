@@ -189,3 +189,25 @@ test('the console exposes a rotate control', async () => {
   assert.ok(page.body.includes('window.confirm'), 'and must ask for confirmation first')
   assert.ok(page.body.includes('立即失效'), 'and must warn that the old token dies immediately')
 })
+
+test('the rotation hint stays a full-width grid row rendered as plain text', async () => {
+  const page = await call('/')
+  const hint = page.body.match(/<div class="hint"[^>]*>[^<]*轮换后[^<]*<\/div>/)
+  assert.ok(hint, 'the CONFIG section must carry the rotation hint')
+
+  // `.kv` is `display:grid; grid-template-columns:auto 1fr`. A hint that participates as an
+  // ordinary grid item lands in column 1, widens that `auto` column to the full sentence, and
+  // starves column 2 (the API-key field plus its three buttons) until they wrap out of the
+  // card. Spanning both columns is what keeps the row intact — this has regressed once.
+  assert.match(hint[0], /grid-column:\s*1\s*\/\s*-1/,
+    'the hint must span both .kv columns or it crushes the API-key row')
+
+  // Typography: the page's sans-serif body and its monospace stack are separate systems, so a
+  // bare <code>/<b> inside a body-text line renders in the browser's default Courier/bold and
+  // stops matching the neighbouring status line. Keep this line plain text.
+  assert.doesNotMatch(hint[0], /<(b|code)>/,
+    'keep the hint plain text so it matches the other status lines')
+
+  assert.match(hint[0], /无需重启/,
+    'and it must carry the current wording, which says no restart is needed')
+})
