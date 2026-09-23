@@ -20,8 +20,13 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { removeDataDir } from './helpers/teardown.mjs'
+
 import { defaultConfig } from '../dist/config.js'
 import { buildState, createBridgeServer } from '../dist/server.js'
+
+/** Holds the fixture state so teardown can flush its pending writes. */
+let bridgeState
 
 const OLD_TOKEN = 'old-token-0123456789abcdef'
 const realFetch = globalThis.fetch
@@ -49,7 +54,7 @@ before(async () => {
     allowedHosts: ['console.example'],
   }, null, 2), 'utf8')
   const cfg = { ...defaultConfig(), host: '0.0.0.0', port: 0, apiKey: OLD_TOKEN, allowedHosts: ['console.example'] }
-  server = createBridgeServer(buildState(cfg, dataDir))
+  server = createBridgeServer((bridgeState = buildState(cfg, dataDir)))
   await new Promise((resolve) => server.once('listening', resolve))
   port = server.address().port
 })
@@ -57,7 +62,7 @@ before(async () => {
 after(async () => {
   globalThis.fetch = realFetch
   await new Promise((resolve) => server.close(resolve))
-  await rm(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir, { pool: bridgeState?.pool })
 })
 
 function call(path, { method = 'GET', headers = {}, body } = {}) {
@@ -148,7 +153,7 @@ test('a non-loopback caller cannot rotate the token', async () => {
   // The source address is spoofed because that is what the handler reads.
   const spoofDir = await mkdtemp(join(tmpdir(), 'cmdgo-rotate-src-'))
   const cfg = { ...defaultConfig(), host: '0.0.0.0', port: 0, apiKey: OLD_TOKEN }
-  const spoofed = createBridgeServer(buildState(cfg, spoofDir))
+  const spoofed = createBridgeServer((bridgeState = buildState(cfg, spoofDir)))
   await new Promise((resolve) => spoofed.once('listening', resolve))
   spoofed.on('connection', (socket) => {
     Object.defineProperty(socket, 'remoteAddress', { value: '10.9.8.7', configurable: true })

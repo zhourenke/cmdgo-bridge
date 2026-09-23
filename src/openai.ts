@@ -56,8 +56,16 @@ export class GatewayError extends Error {
   }
 }
 
-/** Error codes that justify switching to another account within one request. */
-const FAILOVER_CODES = new Set(['AUTH', 'RATE_LIMIT', 'SERVER', 'TRANSPORT'])
+/**
+ * Error codes that justify switching to another account within one request.
+ *
+ * `PERMISSION` (a 403 carrying `MODEL_NOT_IN_PLAN`) is included because plan
+ * coverage is per-account in practice: the whole point of pooling several Go
+ * subscriptions is that their model access differs, and a model one key cannot
+ * reach may be available on the next. Every account is still tried at most once,
+ * and `MAX_FAILOVER_ATTEMPTS` bounds the cost when no account has access.
+ */
+const FAILOVER_CODES = new Set(['AUTH', 'RATE_LIMIT', 'SERVER', 'TRANSPORT', 'PERMISSION'])
 
 /** Hard cap on same-request key failovers, even for very large pools. */
 const MAX_FAILOVER_ATTEMPTS = 4
@@ -398,7 +406,25 @@ async function* gatewayStream(
   // 网关已接受该 key：清掉账号上的失败记账。
   ctx.pool.reportSuccess(account)
   if (!response.body) throw new GatewayError('Command Code 网关返回了空响应体', 502, 'EMPTY_RESPONSE')
-  yield* parseEventStream(response.body)
+  try {
+    yield* parseEventStream(response.body)
+  } catch (error) {
+    // A body that dies mid-stream (connection reset, truncated chunked
+    // encoding, total-budget abort) must not escape as a raw error. Undici
+    // reports these as a bare `TypeError: terminated`, which carries no code, so
+    // nothing downstream can classify it: `openGateway` would skip the account's
+    // failure bookkeeping and the client would see an opaque INTERNAL. Wrapping
+    // it as TRANSPORT is what lets a bad key be cooled down and the next account
+    // be tried (when nothing has been yielded yet).
+    if (ctx.signal?.aborted === true) throw error
+    if (error instanceof GatewayError) throw error
+    if (signal.aborted) throw new GatewayError('Command Code 网关请求超时', 504, 'TIMEOUT')
+    throw new GatewayError(
+      `Command Code 流中断：${error instanceof Error ? error.message : String(error)}`,
+      502,
+      'TRANSPORT',
+    )
+  }
 }
 
 /**
@@ -492,9 +518,24 @@ export async function* openGateway(req: ChatRequest, ctx: CompletionContext): As
       }
       return
     } catch (error) {
+      // A client disconnect is not the account's fault: the caller went away
+      // mid-answer, which says nothing about this key's health. Reporting it
+      // would cool down a perfectly good account and shrink the pool a little
+      // more on every abandoned agent run.
+      const clientGone = ctx.signal?.aborted === true
+      if (error instanceof GatewayError && !clientGone) {
+        // Report BEFORE deciding whether to retry. The two questions are
+        // independent: `yielded` answers "may this request be replayed", while
+        // the failure bookkeeping answers "is this account healthy". Leaving the
+        // report inside the retry branch meant an account that died mid-answer —
+        // the most common way a key goes bad — was never cooled down, so the next
+        // request picked it again and failed the same way.
+        ctx.pool.reportFailure(account, error.message)
+      }
+      // A half-delivered answer must never be replayed, so once anything has been
+      // yielded the error propagates to the caller regardless of its code.
       if (yielded || attempt >= attempts - 1) throw error
       if (!(error instanceof GatewayError) || !FAILOVER_CODES.has(error.code)) throw error
-      ctx.pool.reportFailure(account, error.message)
     }
   }
 }

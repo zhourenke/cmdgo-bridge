@@ -68,7 +68,8 @@ async function bootBridge({ baseURL, seedPool = true }) {
     }), 'utf8')
   }
   const cfg = { ...defaultConfig(), host: '0.0.0.0', port: 0, apiKey: API_KEY, baseURL }
-  const server = createBridgeServer(buildState(cfg, dataDir))
+  const state = buildState(cfg, dataDir)
+  const server = createBridgeServer(state)
   await new Promise((resolve) => server.once('listening', resolve))
   const port = server.address().port
   globalThis.fetch = stubCatalog
@@ -111,8 +112,13 @@ async function bootBridge({ baseURL, seedPool = true }) {
 
   const teardown = async () => {
     globalThis.fetch = realFetch
+    // Drain the manifest writes BEFORE removing the directory: pooled failures
+    // persist asynchronously, so an `rm` racing a pending rename fails with
+    // ENOTEMPTY (the temp file reappears mid-delete) and leaves the directory
+    // behind.
+    await state.pool.flush().catch(() => {})
     await new Promise((resolve) => server.close(resolve))
-    await rm(dataDir, { recursive: true, force: true })
+    await rm(dataDir, { recursive: true, force: true, maxRetries: 5 }).catch(() => {})
   }
   return { call, teardown }
 }

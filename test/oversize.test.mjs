@@ -19,12 +19,17 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer, request } from 'node:http'
 import { connect } from 'node:net'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { removeDataDir } from './helpers/teardown.mjs'
+
 import { defaultConfig } from '../dist/config.js'
 import { buildState, createBridgeServer } from '../dist/server.js'
+
+/** Holds the fixture state so teardown can flush its pending writes. */
+let bridgeState
 
 const API_KEY = 'oversize-test-key-0123456789ab'
 const CAP = 8 * 1024 * 1024
@@ -44,7 +49,7 @@ before(async () => {
   dataDir = await mkdtemp(join(tmpdir(), 'cmdgo-oversize-'))
   globalThis.fetch = stubCatalog
   const cfg = { ...defaultConfig(), host: '0.0.0.0', port: 0, apiKey: API_KEY }
-  server = createBridgeServer(buildState(cfg, dataDir))
+  server = createBridgeServer((bridgeState = buildState(cfg, dataDir)))
   await new Promise((resolve) => server.once('listening', resolve))
   port = server.address().port
 })
@@ -52,7 +57,7 @@ before(async () => {
 after(async () => {
   globalThis.fetch = realFetch
   await new Promise((resolve) => server.close(resolve))
-  await rm(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir, { pool: bridgeState?.pool })
 })
 
 /** Rejects after `ms` so a regression fails the test instead of hanging it. */

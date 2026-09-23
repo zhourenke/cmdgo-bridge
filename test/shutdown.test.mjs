@@ -30,8 +30,13 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { AccountPool } from '../dist/pool.js'
+import { removeDataDir } from './helpers/teardown.mjs'
+
 import { defaultConfig } from '../dist/config.js'
 import { buildState, createBridgeServer } from '../dist/server.js'
+
+/** Holds the fixture state so teardown can flush its pending writes. */
+let bridgeState
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..')
 const API_KEY = 'shutdown-key-0123456789abcdef'
@@ -161,7 +166,7 @@ test('POST /api/account/toggle only reports success once the manifest is on disk
     COMMANDCODE_API_KEY_SOLO: { value: 'user_goodkey' },
   }), 'utf8')
   const cfg = { ...defaultConfig(), host: '0.0.0.0', port: 0, apiKey: API_KEY }
-  const server = createBridgeServer(buildState(cfg, dataDir))
+  const server = createBridgeServer((bridgeState = buildState(cfg, dataDir)))
   await new Promise((resolve) => server.once('listening', resolve))
   const port = server.address().port
   try {
@@ -178,7 +183,7 @@ test('POST /api/account/toggle only reports success once the manifest is on disk
     globalThis.fetch = realFetch
     server.closeAllConnections?.()
     await new Promise((resolve) => server.close(resolve))
-    await rm(dataDir, { recursive: true, force: true })
+    await removeDataDir(dataDir, { pool: bridgeState?.pool })
   }
 })
 
@@ -232,7 +237,7 @@ test('shutdown closes the listener and flushes the pool, in that order', async (
     globalThis.fetch = realFetch
     server.closeAllConnections?.()
     await new Promise((resolve) => server.close(resolve))
-    await rm(dataDir, { recursive: true, force: true })
+    await removeDataDir(dataDir, { pool: bridgeState?.pool })
   }
 })
 
@@ -274,7 +279,7 @@ test('shutdown force-closes connections that outlive the grace period', async ()
     socket.destroy()
     server.closeAllConnections?.()
     await new Promise((resolve) => server.close(resolve))
-    await rm(dataDir, { recursive: true, force: true })
+    await removeDataDir(dataDir, { pool: bridgeState?.pool })
   }
 })
 

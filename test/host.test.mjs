@@ -25,8 +25,13 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { removeDataDir } from './helpers/teardown.mjs'
+
 import { defaultConfig } from '../dist/config.js'
 import { buildState, createBridgeServer, isLoopbackHost } from '../dist/server.js'
+
+/** Holds the fixture state so teardown can flush its pending writes. */
+let bridgeState
 
 const API_KEY = 'test-key-host-0123456789abcd'
 const realFetch = globalThis.fetch
@@ -82,7 +87,7 @@ function callOn(port, path, { method = 'GET', headers = {} } = {}) {
 async function bootWithSourceAddress(spoofedAddress) {
   const dataDir = await mkdtemp(join(tmpdir(), 'cmdgo-src-'))
   const cfg = { ...defaultConfig(), host: '0.0.0.0', port: 0, apiKey: API_KEY }
-  const server = createBridgeServer(buildState(cfg, dataDir))
+  const server = createBridgeServer((bridgeState = buildState(cfg, dataDir)))
   await new Promise((resolve) => server.once('listening', resolve))
   // `connection` fires for every socket before its request is parsed.
   server.on('connection', (socket) => {
@@ -94,7 +99,7 @@ async function bootWithSourceAddress(spoofedAddress) {
     close: async () => {
       globalThis.fetch = realFetch
       await new Promise((resolve) => server.close(resolve))
-      await rm(dataDir, { recursive: true, force: true })
+      await removeDataDir(dataDir, { pool: bridgeState?.pool })
     },
   }
 }
@@ -107,7 +112,7 @@ before(async () => {
   dataDir = await mkdtemp(join(tmpdir(), 'cmdgo-host-'))
   globalThis.fetch = stubCatalog
   const cfg = { ...defaultConfig(), host: '0.0.0.0', port: 0, apiKey: API_KEY }
-  server = createBridgeServer(buildState(cfg, dataDir))
+  server = createBridgeServer((bridgeState = buildState(cfg, dataDir)))
   await new Promise((resolve) => server.once('listening', resolve))
   port = server.address().port
 })
@@ -115,7 +120,7 @@ before(async () => {
 after(async () => {
   globalThis.fetch = realFetch
   await new Promise((resolve) => server.close(resolve))
-  await rm(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir, { pool: bridgeState?.pool })
 })
 
 test('the loopback predicate accepts only addresses that stay on this machine', () => {

@@ -29,12 +29,17 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { request } from 'node:http'
-import { mkdtemp, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { removeDataDir } from './helpers/teardown.mjs'
+
 import { defaultConfig } from '../dist/config.js'
 import { buildState, createBridgeServer } from '../dist/server.js'
+
+/** Holds the fixture state so teardown can flush its pending writes. */
+let bridgeState
 
 const API_KEY = 'contract-key-0123456789abcdef'
 const realFetch = globalThis.fetch
@@ -117,7 +122,7 @@ async function boot(options = {}) {
   }), 'utf8')
   globalThis.fetch = stubCatalog
   const cfg = { ...defaultConfig(), host: '0.0.0.0', port: 0, apiKey: API_KEY, baseURL: upstream.baseURL }
-  const server = createBridgeServer(buildState(cfg, dataDir))
+  const server = createBridgeServer((bridgeState = buildState(cfg, dataDir)))
   await new Promise((resolve) => server.once('listening', resolve))
   const port = server.address().port
   return {
@@ -128,7 +133,7 @@ async function boot(options = {}) {
       globalThis.fetch = realFetch
       server.closeAllConnections?.()
       await new Promise((resolve) => server.close(resolve))
-      await rm(dataDir, { recursive: true, force: true })
+      await removeDataDir(dataDir, { pool: bridgeState?.pool })
       await upstream.close()
     },
   }

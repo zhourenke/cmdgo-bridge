@@ -11,12 +11,17 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { request } from 'node:http'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { removeDataDir } from './helpers/teardown.mjs'
+
 import { defaultConfig } from '../dist/config.js'
 import { buildState, createBridgeServer } from '../dist/server.js'
+
+/** Holds the fixture state so teardown can flush its pending writes. */
+let bridgeState
 
 const API_KEY = 'test-key-0123456789abcdef'
 const realFetch = globalThis.fetch
@@ -49,7 +54,7 @@ before(async () => {
     // Distinctive, so a fallback can be told apart from a disclosed capacity.
     defaultContextWindow: 424_242,
   }
-  server = createBridgeServer(buildState(cfg, dataDir))
+  server = createBridgeServer((bridgeState = buildState(cfg, dataDir)))
   await new Promise((resolve) => server.once('listening', resolve))
   port = server.address().port
 })
@@ -57,7 +62,7 @@ before(async () => {
 after(async () => {
   globalThis.fetch = realFetch
   await new Promise((resolve) => server.close(resolve))
-  await rm(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir, { pool: bridgeState?.pool })
 })
 
 function call(path, { method = 'GET', headers = {}, body } = {}) {

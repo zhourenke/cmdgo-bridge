@@ -50,7 +50,8 @@ async function boot(scenario) {
   }), 'utf8')
   globalThis.fetch = stubCatalog
   const cfg = { ...defaultConfig(), host: '0.0.0.0', port: 0, apiKey: API_KEY, baseURL: upstream.baseURL }
-  const server = createBridgeServer(buildState(cfg, dataDir))
+  const state = buildState(cfg, dataDir)
+  const server = createBridgeServer(state)
   await new Promise((resolve) => server.once('listening', resolve))
   const port = server.address().port
   return {
@@ -58,9 +59,14 @@ async function boot(scenario) {
     chat: (payload) => post(port, '/v1/chat/completions', payload),
     close: async () => {
       globalThis.fetch = realFetch
+      // Drain the manifest writes BEFORE removing the directory: pooled failures
+      // persist asynchronously, so an `rm` racing a pending rename fails with
+      // ENOTEMPTY (the temp file reappears mid-delete) and the leftover handle
+      // then keeps the whole test process alive.
+      await state.pool.flush().catch(() => {})
       server.closeAllConnections?.()
       await new Promise((resolve) => server.close(resolve))
-      await rm(dataDir, { recursive: true, force: true })
+      await rm(dataDir, { recursive: true, force: true, maxRetries: 5 }).catch(() => {})
       await upstream.close()
     },
   }

@@ -23,8 +23,18 @@ import { createServer } from 'node:http'
 /** Upstream events the bridge expects on `POST /alpha/generate` (NDJSON). */
 const SCENARIOS = {
   /**
-   * Two text deltas, then the socket dies: no `finish-step`, no usage. This is
-   * the shape that must NOT be reported downstream as a completed answer.
+   * Two text deltas, then the connection dies: no `finish-step`, no usage. This
+   * is the shape that must NOT be reported downstream as a completed answer.
+   *
+   * The two stages are deliberate: the deltas are written and FLUSHED, and only
+   * then does the socket die. Killing it in the write callback races the kernel —
+   * the response is torn down before anything reaches the client, so the failure
+   * arrives as a request-time `fetch failed` and the deltas are lost. Waiting for
+   * the write to drain puts the answer on the wire first, which is the case worth
+   * testing: a truncated answer that was already partly delivered.
+   *
+   * `res.destroy()` (not `end()`) is what makes this a failure rather than a
+   * completion — a stream that simply stops is a legitimate end.
    */
   'die-mid-stream': (res, send) => {
     res.statusCode = 200
@@ -32,7 +42,12 @@ const SCENARIOS = {
     send({ type: 'text-start' })
     send({ type: 'text-delta', text: 'partial answer part one ' })
     send({ type: 'text-delta', text: 'part two' })
-    setTimeout(() => res.destroy(), 60)
+    // `write` alone only queues the bytes; wait for the flush, then kill it.
+    res.write('', () => {
+      setTimeout(() => {
+        if (!res.destroyed) res.destroy()
+      }, 30)
+    })
   },
   /** Events arrive and the stream ends cleanly, but `finish-step` never comes. */
   'no-finish-step': (res, send) => {
