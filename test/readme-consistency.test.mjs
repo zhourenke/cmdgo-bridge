@@ -20,7 +20,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { readFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
 const readme = await readFile(join(process.cwd(), 'README.md'), 'utf8')
@@ -91,4 +91,44 @@ test('the README documents the two independent tokens', () => {
   // upstream login does not rotate the downstream token, and vice versa.
   assert.match(readme, /两个独立的东西/)
   assert.match(readme, /轮换/)
+})
+
+test('the README records every accepted risk (gate 5 / D-5)', () => {
+  // Not-fixed is a legitimate outcome, but an undocumented not-fixed is a trap: the
+  // next reader assumes the protection exists. Each acceptance must be visible.
+  assert.match(readme, /已知限制与接受的风险/)
+  for (const finding of ['F-24', 'F-15', 'F-19', 'F-20', 'F-31', 'F-28', 'F-26', 'F-32']) {
+    assert.ok(readme.includes(finding), `the accepted risk ${finding} is no longer recorded in README.md`)
+  }
+  // F-24 must state the actual mitigation honestly, not promise a switch that does
+  // not exist. The env var below was in an early draft of the acceptance note and is
+  // NOT implemented anywhere in src/ — documenting it would send an operator to a
+  // setting that silently does nothing.
+  assert.doesNotMatch(readme, /CMDGO_IMAGE_ALLOW_REMOTE/,
+    'no such env var exists; remote images cannot be disabled by configuration')
+})
+
+test('every CMDGO_* env var the README names as configuration actually exists in src/', async () => {
+  // The inverse direction: an operator following the README must not be sent to a
+  // setting that is never read. `config.ts` is the only place these are parsed.
+  //
+  // The README also shows one-off inline env vars for running the test suite (e.g.
+  // `CMDGO_TEST_NETWORK=1 node --test ...`). Those are read by the TEST files, not by
+  // config.ts, so they are checked against the test directory instead.
+  const configSource = await readFile(join(process.cwd(), 'src', 'config.ts'), 'utf8')
+  const testSource = (await Promise.all(
+    (await readdir(join(process.cwd(), 'test')))
+      .filter((name) => name.endsWith('.mjs'))
+      .map((name) => readFile(join(process.cwd(), 'test', name), 'utf8')),
+  )).join('\n')
+
+  const named = [...new Set(readme.match(/CMDGO_[A-Z_]+/g) ?? [])]
+  const unknown = named.filter((name) => !configSource.includes(name) && !testSource.includes(name))
+  assert.deepEqual(unknown, [], `README names env vars that nothing reads: ${unknown.join(', ')}`)
+
+  // The documented configuration surface is exactly what config.ts parses: nothing
+  // missing, nothing invented.
+  const implemented = [...new Set((configSource.match(/CMDGO_[A-Z_]+/g) ?? []))]
+  const undocumented = implemented.filter((name) => !readme.includes(name))
+  assert.deepEqual(undocumented, [], `src/config.ts reads env vars the README never mentions: ${undocumented.join(', ')}`)
 })
