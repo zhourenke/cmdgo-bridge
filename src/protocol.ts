@@ -252,8 +252,19 @@ export function buildRequest(options: GenerateOptions): CcRequestEnvelope {
   }
   if (options.temperature !== undefined) params.temperature = options.temperature
   if (options.topP !== undefined) params.top_p = options.topP
-  if (options.reasoningEffort !== undefined && options.reasoningEffort !== 'off') {
-    params.reasoning_effort = options.reasoningEffort
+  // `reasoning_effort` is normalized, not pattern-matched.
+  //
+  // The gateway treats the field as optional, so "do not reason" is expressed by
+  // OMITTING it. Hardcoding one spelling of that (`'off'`) meant every other
+  // spelling — `'OFF'`, `'none'`, `'disabled'` — was forwarded verbatim, and an
+  // upstream that rejects unknown effort values would then answer 400 to a
+  // request that only ever meant "no reasoning please". Casefolding and accepting
+  // the spellings that unambiguously mean off keeps that intent without asking the
+  // client to guess ours. Anything else is passed through lowercased: the value
+  // set is the gateway's to define (`minimal`/`low`/`medium`/`high` today).
+  const effort = options.reasoningEffort?.trim().toLowerCase()
+  if (effort !== undefined && effort !== '' && effort !== 'off' && effort !== 'none' && effort !== 'disabled') {
+    params.reasoning_effort = effort
   }
 
   return {
