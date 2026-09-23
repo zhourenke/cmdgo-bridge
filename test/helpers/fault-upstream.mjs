@@ -64,6 +64,37 @@ const SCENARIOS = {
     })
     res.end()
   },
+  /**
+   * `finish-step` carrying a reason this bridge does not know. Must surface as
+   * `finish_reason: null` (OpenAI's "not applicable"), never as `'stop'`: the
+   * consumer decides whether a turn ended on this field, and a wrong `'stop'`
+   * claims the model chose to finish when it may have been cut off.
+   */
+  'unknown-finish-reason': (res, send) => {
+    res.statusCode = 200
+    res.setHeader('Content-Type', 'application/x-ndjson')
+    send({ type: 'text-start' })
+    send({ type: 'text-delta', text: 'answer with a novel stop reason' })
+    send({
+      type: 'finish-step',
+      finishReason: 'content_filter_v2',
+      usage: {
+        inputTokenDetails: { noCacheTokens: 3, cacheReadTokens: 0 },
+        outputTokens: 2,
+        outputTokenDetails: { textTokens: 2, reasoningTokens: 0 },
+      },
+    })
+    res.end()
+  },
+  /** A finish-step with no reason field at all. */
+  'missing-finish-reason': (res, send) => {
+    res.statusCode = 200
+    res.setHeader('Content-Type', 'application/x-ndjson')
+    send({ type: 'text-start' })
+    send({ type: 'text-delta', text: 'answer without a stated reason' })
+    send({ type: 'finish-step' })
+    res.end()
+  },
 }
 
 /**

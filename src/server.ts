@@ -509,8 +509,8 @@ export function createBridgeServer(state: BridgeState): Server {
     })
   }
 
-  function openaiErrorBody(message: string, code: string): unknown {
-    return { error: { message, type: 'invalid_request_error', code, param: null } }
+  function openaiErrorBody(message: string, code: string, param: string | null = null): unknown {
+    return { error: { message, type: 'invalid_request_error', code, param } }
   }
 
   /**
@@ -555,7 +555,9 @@ export function createBridgeServer(state: BridgeState): Server {
     } catch (error) {
       const message = error instanceof ClientError ? error.message : 'invalid request'
       const status = error instanceof ClientError ? error.httpStatus : 400
-      jsonError(res, status, openaiErrorBody(message, 'invalid_request_error'))
+      const param = error instanceof ClientError ? error.param ?? null : null
+      const code = error instanceof ClientError ? error.code : 'invalid_request_error'
+      jsonError(res, status, openaiErrorBody(message, code, param))
       closeAfterOversize(req, res, status)
       logLine(`[cmdgo] chat 请求被拒 ${status} ${message}`)
       return
@@ -587,19 +589,23 @@ export function createBridgeServer(state: BridgeState): Server {
       }
       try {
         const acc = emptyAccumulator()
-        let finished = false
+        // The gateway ended the response body without error, so this completes:
+        // whatever arrived is the answer, and `finish_reason` stays null when no
+        // recognised `finish-step` was seen (see buildNonStream). Treating a
+        // clean end as a 502 would discard a complete answer, and the failure
+        // cases that matter — a truncated body, a reset socket — surface as
+        // thrown errors from the iterator, not as a well-formed end.
         for await (const event of openGateway(chat, ctx)) {
           applyEvent(acc, event)
-          if (event.type === 'finish-step') { finished = true; break }
+          if (event.type === 'finish-step') break
         }
-        if (!finished) throw new GatewayError('Command Code 网关未发送 finish-step', 502, 'STREAM_CLOSED')
         json(res, 200, buildNonStream(chat, acc))
-        logOutcome('ok')
+        logOutcome(acc.finishStepSeen ? 'ok' : 'ok-no-finish-step')
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         if (error instanceof ClientError) {
-          json(res, error.httpStatus, openaiErrorBody(message, 'invalid_request_error'))
-          logOutcome('client-error', message)
+          json(res, error.httpStatus, openaiErrorBody(message, error.code, error.param ?? null))
+          logOutcome(`error ${error.code}`, message)
         } else if (error instanceof GatewayError) {
           json(res, error.httpStatus, openaiErrorBody(message, error.code))
           logOutcome(`error ${error.code}`, message)
@@ -765,7 +771,10 @@ export function createBridgeServer(state: BridgeState): Server {
         // 让缺少 [DONE] 本身成为可判定的终止信号。
         res.end()
       } else {
-        emit(choice({}, acc.finishReason ?? 'stop'))
+        // `acc.finishReason` is already `string | null`, and null is the honest
+        // value when the gateway sent no recognisable reason. A `?? 'stop'` here
+        // re-invented the reason the accumulator deliberately refuses to invent.
+        emit(choice({}, acc.finishStepSeen ? acc.finishReason : null))
         emit({ ...meta, choices: [], usage: usageObject(acc) })
         res.end('data: [DONE]\n\n')
       }

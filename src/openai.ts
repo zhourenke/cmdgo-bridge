@@ -37,7 +37,14 @@ export interface ChatRequest {
 
 /** Request-side validation failure; mapped to a 4xx JSON error. */
 export class ClientError extends Error {
-  constructor(message: string, readonly httpStatus = 400) {
+  constructor(
+    message: string,
+    readonly httpStatus = 400,
+    /** OpenAI `error.param`, when the fault is one field. */
+    readonly param?: string,
+    /** OpenAI `error.code`; defaults to `invalid_request_error`. */
+    readonly code = 'invalid_request_error',
+  ) {
     super(message)
   }
 }
@@ -216,6 +223,29 @@ function positiveInt(value: unknown, fallback: number | undefined): number | und
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : fallback
 }
 
+/**
+ * Reads an OpenAI token-limit field, rejecting a malformed value outright.
+ *
+ * The old `positiveInt` helper silently fell back to the default for anything it
+ * did not recognise, so `max_tokens: 0`, `-1`, `"100"` or `1.5` all produced a
+ * normal 200 whose length the caller had never asked for. A client that sets a
+ * limit and silently gets a different one cannot reason about truncation, and
+ * `-1` is a conventional "no limit" that this bridge does not honour — so it
+ * has to be an error, not a surprise. OpenAI answers 400 with `param` naming the
+ * offending field; the same shape is produced here.
+ *
+ * A large value like `1e9` is deliberately NOT rejected: it is a safe integer and
+ * a legal token count, and callers use big sentinels to mean "as long as
+ * possible". Absent and `null` mean "unset" for the same reason.
+ */
+function requiredPositiveInt(value: unknown, field: string): number | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    throw new ClientError(`${field} must be a positive integer`, 400, field)
+  }
+  return value
+}
+
 function optionalNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
@@ -246,7 +276,8 @@ export async function parseChatRequest(
     }
     return { name: '', parameters: { type: 'object', properties: {} } }
   }).filter(tool => tool.name.length > 0)
-  const maxTokens = positiveInt(body.max_tokens, positiveInt(body.max_completion_tokens, undefined))
+  const maxTokens = requiredPositiveInt(body.max_tokens, 'max_tokens')
+    ?? requiredPositiveInt(body.max_completion_tokens, 'max_completion_tokens')
     ?? DEFAULT_MAX_TOKENS
   const budget = new ImageBudget(ctx.imageLimits)
   return {
@@ -465,6 +496,13 @@ export interface Accumulator {
   toolCalls: ToolCallRecord[]
   finishReason: string | null
   /**
+   * Whether the gateway actually sent a `finish-step`.
+   *
+   * Distinguishes "the model stopped and said why" from "the stream ended";
+   * the latter leaves `finishReason` null rather than inventing `'stop'`.
+   */
+  finishStepSeen: boolean
+  /**
    * Uncached input tokens, disjoint from `cacheReadTokens`.
    *
    * The gateway reports the two halves separately (`noCacheTokens` /
@@ -475,11 +513,26 @@ export interface Accumulator {
   uncachedInputTokens: number
   /** Upstream's own `outputTokens`, or undefined when it did not report one. */
   reportedCompletionTokens?: number
-  /** Visible-answer tokens (`outputTokenDetails.textTokens`). */
-  textTokens: number
+  /**
+   * Visible-answer characters counted from the deltas themselves, independent of
+   * anything the gateway reports.
+   *
+   * The gateway's counters only arrive with `finish-step`. A stream that ends
+   * without one — a normal end, not a failure — would otherwise serialize
+   * `completion_tokens: 0` while carrying a complete answer, which downstream
+   * books as a free success and under-bills the account. Characters are the
+   * proxy rather than words because whitespace tokenisation collapses CJK text
+   * to nothing.
+   */
+  streamedTextChars: number
+  /** Gateway-reported visible-answer tokens (`outputTokenDetails.textTokens`). */
+  reportedTextTokens?: number
   cacheReadTokens: number
   reasoningTokens: number
 }
+
+/** Rough characters-per-token ratio for the synthesized fallback count. */
+const CHARS_PER_TOKEN = 4
 
 /**
  * Completion token count for the OpenAI wire.
@@ -496,10 +549,20 @@ export interface Accumulator {
  *
  * So: trust the explicit total when it is at least the sum of the parts, use the
  * sum when it is larger, and never let the total fall below `reasoning_tokens`.
+ * When the gateway reported nothing at all, the synthesized count from the
+ * streamed characters is the only evidence of what was delivered.
  */
-export function completionTokensOf(acc: Pick<Accumulator, 'reportedCompletionTokens' | 'textTokens' | 'reasoningTokens'>): number {
-  const parts = acc.textTokens + acc.reasoningTokens
-  return Math.max(acc.reportedCompletionTokens ?? 0, parts)
+export function completionTokensOf(
+  acc: Pick<Accumulator, 'reportedCompletionTokens' | 'reportedTextTokens' | 'streamedTextChars' | 'reasoningTokens'>,
+): number {
+  // Every field defaults to 0 individually rather than relying on the caller to
+  // supply a whole accumulator: this is exported, and a single missing counter
+  // used to turn the whole result into NaN, which then serialized as `null`.
+  const reasoning = acc.reasoningTokens ?? 0
+  const streamed = acc.streamedTextChars ?? 0
+  const reportedParts = (acc.reportedTextTokens ?? 0) + reasoning
+  const parts = Math.max(reportedParts, Math.ceil(streamed / CHARS_PER_TOKEN) + reasoning)
+  return Math.max(acc.reportedCompletionTokens ?? 0, parts) || 0
 }
 
 export function emptyAccumulator(): Accumulator {
@@ -508,9 +571,11 @@ export function emptyAccumulator(): Accumulator {
     reasoning: '',
     toolCalls: [],
     finishReason: null,
+    finishStepSeen: false,
     uncachedInputTokens: 0,
     reportedCompletionTokens: undefined,
-    textTokens: 0,
+    streamedTextChars: 0,
+    reportedTextTokens: undefined,
     cacheReadTokens: 0,
     reasoningTokens: 0,
   }
@@ -522,6 +587,9 @@ export function applyEvent(acc: Accumulator, event: CcStreamEvent): void {
     case 'text-delta': {
       const text = typeof event.text === 'string' ? event.text : ''
       acc.content += text
+      // Counted here, not from `finish-step`, so a stream that ends without one
+      // still reports the tokens it delivered.
+      acc.streamedTextChars += text.length
       break
     }
     case 'reasoning-delta': {
@@ -543,7 +611,8 @@ export function applyEvent(acc: Accumulator, event: CcStreamEvent): void {
       break
     }
     case 'finish-step': {
-      acc.finishReason = finishReasonOf(event.finishReason ?? event.rawFinishReason ?? 'stop')
+      acc.finishReason = finishReasonOf(event.finishReason ?? event.rawFinishReason)
+      acc.finishStepSeen = true
       const usage = isRecord(event.usage) ? event.usage : undefined
       if (usage !== undefined) {
         const inputDetails = isRecord(usage.inputTokenDetails) ? usage.inputTokenDetails : undefined
@@ -556,7 +625,7 @@ export function applyEvent(acc: Accumulator, event: CcStreamEvent): void {
           : totalInput) ?? 0
         acc.cacheReadTokens = cacheRead ?? 0
         acc.reportedCompletionTokens = optionalNumber(usage.outputTokens)
-        acc.textTokens = optionalNumber(outputDetails?.textTokens) ?? 0
+        acc.reportedTextTokens = optionalNumber(outputDetails?.textTokens)
         acc.reasoningTokens = optionalNumber(outputDetails?.reasoningTokens) ?? 0
       }
       break
@@ -566,10 +635,18 @@ export function applyEvent(acc: Accumulator, event: CcStreamEvent): void {
   }
 }
 
-/** Map the gateway finish-reason vocabulary to the OpenAI one. */
-function finishReasonOf(raw: unknown): string {
-  const reason = typeof raw === 'string' ? raw : 'stop'
-  switch (reason) {
+/**
+ * Map the gateway finish-reason vocabulary to the OpenAI one.
+ *
+ * Returns null for anything unrecognised — including a missing field — because
+ * `finish_reason` is how a consumer decides whether an answer is complete, and
+ * the OpenAI schema allows null for "not applicable". Folding an unknown or
+ * absent reason into `'stop'` claims the model chose to end its turn when the
+ * bridge does not actually know that.
+ */
+function finishReasonOf(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  switch (raw) {
     case 'stop':
     case 'end_turn':
       return 'stop'
@@ -581,7 +658,7 @@ function finishReasonOf(raw: unknown): string {
     case 'max-output-tokens':
       return 'length'
     default:
-      return 'stop'
+      return null
   }
 }
 
@@ -645,7 +722,10 @@ export function buildNonStream(req: ChatRequest, acc: Accumulator): unknown {
         ...(acc.reasoning.length > 0 ? { reasoning_content: acc.reasoning } : {}),
         ...(acc.toolCalls.length > 0 ? { tool_calls: toolCallsObject(acc.toolCalls) } : {}),
       },
-      finish_reason: acc.finishReason ?? 'stop',
+      // The gateway's own reason when it gave one; null when the stream ended
+      // without a recognised `finish-step`. Claiming `'stop'` here would tell a
+      // consumer the model finished its turn on evidence the bridge never got.
+      finish_reason: acc.finishStepSeen ? acc.finishReason : null,
     }],
     usage: usageObject(acc),
   }

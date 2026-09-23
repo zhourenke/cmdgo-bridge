@@ -122,9 +122,22 @@ test('an absent usage event leaves a consistent all-zero block', () => {
 })
 
 test('completionTokensOf is the documented max, not a sum that can regress', () => {
-  assert.equal(completionTokensOf({ reportedCompletionTokens: 5, textTokens: 1, reasoningTokens: 1 }), 5)
-  assert.equal(completionTokensOf({ reportedCompletionTokens: 2, textTokens: 1, reasoningTokens: 9 }), 10)
-  assert.equal(completionTokensOf({ textTokens: 0, reasoningTokens: 0 }), 0)
+  assert.equal(completionTokensOf({ reportedCompletionTokens: 5, reportedTextTokens: 1, reasoningTokens: 1 }), 5)
+  assert.equal(completionTokensOf({ reportedCompletionTokens: 2, reportedTextTokens: 1, reasoningTokens: 9 }), 10)
+  assert.equal(completionTokensOf({ reportedTextTokens: 0, reasoningTokens: 0 }), 0)
+})
+
+test('a stream with no reported usage is counted from the deltas it delivered', () => {
+  // `completionTokensOf` reads `streamedTextChars` (chars / 4) so that a stream
+  // ending without a finish-step still reports what it delivered instead of
+  // serializing `completion_tokens: 0` over a complete answer.
+  assert.equal(completionTokensOf({ streamedTextChars: 40, reasoningTokens: 0 }), 10)
+  assert.equal(completionTokensOf({ streamedTextChars: 0, reasoningTokens: 0 }), 0)
+  // A gateway-reported count still wins when it is larger than the estimate.
+  assert.equal(completionTokensOf({ reportedCompletionTokens: 99, streamedTextChars: 40, reasoningTokens: 0 }), 99)
+  // ...and the estimate wins when the reported visible count is smaller, so
+  // reasoning never exceeds the total.
+  assert.equal(completionTokensOf({ reportedTextTokens: 1, streamedTextChars: 40, reasoningTokens: 9 }), 19)
 })
 
 test('a nonsense negative counter cannot corrupt the block', () => {
