@@ -16,6 +16,7 @@
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { randomBytes } from 'node:crypto'
+import { SECRET_DIR_MODE, SECRET_FILE_MODE } from './secrets.js'
 import { readJsonObject } from './config.js'
 
 /**
@@ -184,9 +185,9 @@ export class AccountPool {
     const payload = JSON.stringify({ version: 1, accounts: this.accounts } satisfies Manifest, null, 2)
     const run = async (): Promise<void> => {
       try {
-        await mkdir(dirname(path), { recursive: true })
+        await mkdir(dirname(path), { recursive: true, mode: SECRET_DIR_MODE })
         const tmp = `${path}.${randomBytes(4).toString('hex')}.tmp`
-        await writeFile(tmp, payload, 'utf8')
+        await writeFile(tmp, payload, { encoding: 'utf8', mode: SECRET_FILE_MODE })
         await rename(tmp, path)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)

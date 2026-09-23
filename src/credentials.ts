@@ -8,6 +8,7 @@
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { randomBytes } from 'node:crypto'
+import { SECRET_DIR_MODE, SECRET_FILE_MODE } from './secrets.js'
 import { readJsonObject } from './config.js'
 import type { CredentialRef, CredentialsSeam } from './pool.js'
 
@@ -65,9 +66,12 @@ export class FileCredentials implements CredentialsSeam {
   }
 
   private async write(store: StoreShape): Promise<void> {
-    await mkdir(dirname(this.file), { recursive: true })
+    await mkdir(dirname(this.file), { recursive: true, mode: SECRET_DIR_MODE })
     const tmp = `${this.file}.${randomBytes(4).toString('hex')}.tmp`
-    await writeFile(tmp, JSON.stringify(store, null, 2), 'utf8')
+    // `mode` here is exact — Node does not apply the umask when it is explicit —
+    // and it is set on the temp file, so the secret is never briefly world-readable
+    // between creation and a later chmod.
+    await writeFile(tmp, JSON.stringify(store, null, 2), { encoding: 'utf8', mode: SECRET_FILE_MODE })
     await rename(tmp, this.file)
   }
 

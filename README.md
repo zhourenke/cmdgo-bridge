@@ -209,6 +209,16 @@ curl.exe -s -o NUL -w "new=%{http_code}`n" -H "Authorization: Bearer <新token>"
 >
 > 手改文件用无 BOM 的 UTF-8 最稳妥，但**带 BOM 也不会再出问题**：三个状态文件（`config.json` / `credentials.json` / `accounts.json`）现在都会先剥掉 UTF-8 BOM 再解析。此前 BOM 会让 `config.json` 被判定为损坏并**静默重新随机生成**一个 key（所有下游 401，且日志不说明原因），也会让 `accounts.json` / `credentials.json` 读成"空"，进而被下一次写入覆盖掉——这也是控制台「轮换」按钮存在的原因。
 
+### 文件权限
+
+数据目录里 `config.json`（下游 token）、`credentials.json`（上游 key）、`accounts.json`（账号元数据）都是**机密**，三者写入时都显式带 `mode 0o600`（目录 `0o700`），并且这个权限设在**临时文件**上、随后才 `rename` 成正式文件——先写再 `chmod` 会留下一段"文件已存在但仍是 0644"的窗口。启动时还会对这三个文件做一次 `chmod`，因为**旧的安装**（修复前写入的）会一直保持 0644，直到有人碰巧切换账号才重写。
+
+- 显式的 `mode` **不受 umask 影响**（Node 只在未指定 `mode` 时才套 umask），所以管理员把 umask 设得很松也不影响结果。
+- **Windows 上这是 no-op**：Node 只把 mode 位映射到"只读"属性，真正的保护来自 NTFS ACL。收紧失败会打一行 `[cmdgo] 无法收紧 … 权限` 到 stderr，但**不会阻止启动**——加固措施不该变成一次宕机。
+- 审计实测（Linux 数据目录）曾为 `config.json` / `credentials.json` / `accounts.json` / `access.log` 全部 `0666`，即在共享主机上任何本地账号都能读到 key。
+
+
+
 ## 并发与背压
 
 3 人共享时最容易踩的不是额度，而是**并发**：一个 Agent 工作区同时开多个会话，就会在桥这一侧变成同数量的上游并发请求，其他人全排在它们后面，而且排队发生在供应商那边——桥看不到，也没法告诉你。

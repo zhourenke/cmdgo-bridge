@@ -9,6 +9,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { randomBytes } from 'node:crypto'
+import { SECRET_DIR_MODE, SECRET_FILE_MODE } from './secrets.js'
 import { DEFAULT_IMAGE_LIMITS } from './image.js'
 import type { ImageLimits } from './image.js'
 
@@ -203,9 +204,9 @@ export class ConfigStore {
   }
 
   async save(config: ServerConfig): Promise<void> {
-    await mkdir(this.dir, { recursive: true })
+    await mkdir(this.dir, { recursive: true, mode: SECRET_DIR_MODE })
     const tmp = `${this.file}.${randomBytes(4).toString('hex')}.tmp`
-    await writeFile(tmp, JSON.stringify(config, null, 2), 'utf8')
+    await writeFile(tmp, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: SECRET_FILE_MODE })
     await rename(tmp, this.file)
   }
 }

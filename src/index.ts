@@ -16,6 +16,7 @@ import { pathToFileURL } from 'node:url'
 
 import { ConfigStore, DEFAULT_DATA_DIR } from './config.js'
 import { buildState, createBridgeServer, isLoopbackHost } from './server.js'
+import { hardenFile } from './secrets.js'
 
 /** Grace period for in-flight requests during shutdown, before force-closing. */
 export const SHUTDOWN_GRACE_MS = 10_000
@@ -90,6 +91,28 @@ function parseArgs(argv: string[]): { host?: string; port?: number; dataDir?: st
   return out
 }
 
+/**
+ * Shrinks the permissions of every secret-bearing file in the data directory.
+ *
+ * `config.json` holds the downstream token, `credentials.json` the upstream keys,
+ * and `accounts.json` their names. Files written before the mode fix keep whatever
+ * permissions they were created with (`0o644` under a typical umask, i.e. readable
+ * by every local account on a shared Unix host), and nothing rewrites them until
+ * an account is toggled — so a startup pass is what actually closes that window.
+ *
+ * Best-effort: `hardenFile` logs and continues on failure.
+ *
+ * @param dataDir resolved data directory
+ */
+async function hardenDataDirFiles(dataDir: string): Promise<void> {
+  const { join } = await import('node:path')
+  await Promise.all([
+    hardenFile(join(dataDir, 'config.json'), 'config.json'),
+    hardenFile(join(dataDir, 'credentials.json'), 'credentials.json'),
+    hardenFile(join(dataDir, 'accounts.json'), 'accounts.json'),
+  ])
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2))
   if (args.help) {
@@ -136,6 +159,11 @@ http://127.0.0.1:<port>/ 使用控制台完成 OAuth 登录。`)
   }
 
   const state = buildState(cfg, store.dataDir)
+  // Shrink the permissions of files written before this hardening existed.
+  // Awaited but never fatal (see `hardenFile`), and run before the manifest is
+  // loaded so an operator sees the warning next to the startup banner rather than
+  // in the middle of the first request.
+  await hardenDataDirFiles(store.dataDir)
   // Load the account manifest now rather than on the first chat request, so a
   // corrupt accounts.json is reported at startup with a readable message instead
   // of as an unhandled rejection from inside a request handler.
