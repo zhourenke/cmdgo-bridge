@@ -1,5 +1,5 @@
 /**
- * Guards the README statements that audit section 5 found wrong or incomplete (F-35).
+ * Guards the documentation statements that audit section 5 found wrong or incomplete (F-35).
  *
  * Five rows were outright INCONSISTENT with the code and twelve were partial. Those
  * are operator-facing: two of the inconsistencies (the `host` description and the
@@ -8,6 +8,11 @@
  * edit that quietly drops one of these statements would restore the exact problem the
  * audit found, and nothing else in the suite would notice — the code would still be
  * correct while the documentation told operators the opposite.
+ *
+ * The statements live in README.md (user-facing) and DEVELOPMENT.md (engineering and
+ * operations). Because content moves between the two, these checks read the
+ * concatenation of both: pinning a row to one file would fail on a legitimate
+ * relocation while proving nothing extra about whether the subject is addressed.
  *
  * These assertions are keyword-based on purpose. Pinpointing a Chinese sentence
  * verbatim would make the test fail on any wording improvement, which is the wrong
@@ -23,7 +28,10 @@ import assert from 'node:assert/strict'
 import { readFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
-const readme = await readFile(join(process.cwd(), 'README.md'), 'utf8')
+const read = (name) => readFile(join(process.cwd(), name), 'utf8')
+const README = await read('README.md')
+const DEVELOPMENT = await read('DEVELOPMENT.md')
+const docs = `${README}\n${DEVELOPMENT}`
 
 /**
  * Each row lists patterns that must ALL appear. Grouped by the audit's own sections
@@ -70,57 +78,69 @@ const REQUIRED = {
 }
 
 for (const [row, patterns] of Object.entries(REQUIRED)) {
-  test(`README covers audit row: ${row}`, () => {
-    const absent = patterns.filter((pattern) => !pattern.test(readme))
+  test(`the docs cover audit row: ${row}`, () => {
+    const absent = patterns.filter((pattern) => !pattern.test(docs))
     assert.deepEqual(absent.map((p) => p.source), [],
-      `README.md no longer addresses this audited inconsistency (F-35): ${row}`)
+      `README.md/DEVELOPMENT.md no longer address this audited inconsistency (F-35): ${row}`)
   })
 }
 
-test('the README does not repeat the two retracted audit claims', () => {
+test('the docs do not repeat the two retracted audit claims', () => {
   // The audit's own §2 withdrew two findings after re-testing: a domain `Host` was
   // never bypassable, and a trailing dot plus uppercase was already refused. If the
-  // README started claiming those protections were ADDED, it would be describing a
+  // docs started claiming those protections were ADDED, they would be describing a
   // change that never happened.
-  assert.doesNotMatch(readme, /尾点归一化/, 'no trailing-dot normalization was implemented')
-  assert.doesNotMatch(readme, /仅接受同源请求/, 'the retracted same-origin claim must not come back')
+  assert.doesNotMatch(docs, /尾点归一化/, 'no trailing-dot normalization was implemented')
+  assert.doesNotMatch(docs, /仅接受同源请求/, 'the retracted same-origin claim must not come back')
 })
 
-test('the README documents the two independent tokens', () => {
+test('the docs document the two independent tokens', () => {
   // The single most consequential thing an operator must understand: rotating the
   // upstream login does not rotate the downstream token, and vice versa.
-  assert.match(readme, /两个独立的东西/)
-  assert.match(readme, /轮换/)
+  assert.match(docs, /两个独立的东西/)
+  assert.match(docs, /轮换/)
 })
 
-test('the README records every accepted risk (gate 5 / D-5)', () => {
+test('the docs record every accepted risk (gate 5 / D-5)', () => {
   // Not-fixed is a legitimate outcome, but an undocumented not-fixed is a trap: the
   // next reader assumes the protection exists. Each acceptance must be visible.
-  assert.match(readme, /已知限制与接受的风险/)
+  assert.match(docs, /已知限制与接受的风险/)
   for (const finding of ['F-24', 'F-15', 'F-19', 'F-20', 'F-31', 'F-28', 'F-26', 'F-32']) {
-    assert.ok(readme.includes(finding), `the accepted risk ${finding} is no longer recorded in README.md`)
+    assert.ok(docs.includes(finding), `the accepted risk ${finding} is no longer recorded in the docs`)
   }
   // F-24 must state the actual mitigation honestly. An earlier draft of this check
   // asserted the OPPOSITE — that `CMDGO_IMAGE_ALLOW_REMOTE` appeared nowhere, because
-  // at the time the README promised a switch that no code read, and documenting a
+  // at the time the docs promised a switch that no code read, and documenting a
   // nonexistent setting sends an operator to a knob that silently does nothing.
   //
   // The switch now exists (D-5 approved it; `src/config.ts` parses it and
-  // `src/image.ts` enforces it), so the assertion is inverted: the README must NAME
+  // `src/image.ts` enforces it), so the assertion is inverted: the docs must NAME
   // it, and the acceptance note must say the race itself is still unmitigated rather
   // than implying the switch removes it. The existence direction is covered by the
   // `CMDGO_*` cross-check below.
-  assert.match(readme, /CMDGO_IMAGE_ALLOW_REMOTE/,
+  assert.match(docs, /CMDGO_IMAGE_ALLOW_REMOTE/,
     'the switch now exists, so the accepted-risk note must name it as the available mitigation')
-  assert.match(readme, /竞态本身未消除/,
+  assert.match(docs, /竞态本身未消除/,
     'turning remote fetching off must not be described as fixing the rebinding race itself')
 })
 
-test('every CMDGO_* env var the README names as configuration actually exists in src/', async () => {
-  // The inverse direction: an operator following the README must not be sent to a
+test('the README stays user-facing: no audit codes or source paths', () => {
+  // The README is the only document a person who just wants to run this bridge
+  // should need. Audit finding codes and source paths are internal-process
+  // vocabulary, and their presence is a reliable signal that an engineering note
+  // has leaked back into the user-facing document instead of living in
+  // DEVELOPMENT.md. The content itself is still checked above against `docs`.
+  assert.doesNotMatch(README, /\bF-\d{2}\b/,
+    'audit finding codes belong in DEVELOPMENT.md')
+  assert.doesNotMatch(README, /\bsrc\/[a-z-]+\.ts\b/,
+    'source paths belong in DEVELOPMENT.md')
+})
+
+test('every CMDGO_* env var the docs name as configuration actually exists in src/', async () => {
+  // The inverse direction: a user following the docs must not be sent to a
   // setting that is never read. `config.ts` is the only place these are parsed.
   //
-  // The README also shows one-off inline env vars for running the test suite (e.g.
+  // The docs also show one-off inline env vars for running the test suite (e.g.
   // `CMDGO_TEST_NETWORK=1 node --test ...`). Those are read by the TEST files, not by
   // config.ts, so they are checked against the test directory instead.
   const configSource = await readFile(join(process.cwd(), 'src', 'config.ts'), 'utf8')
@@ -130,13 +150,13 @@ test('every CMDGO_* env var the README names as configuration actually exists in
       .map((name) => readFile(join(process.cwd(), 'test', name), 'utf8')),
   )).join('\n')
 
-  const named = [...new Set(readme.match(/CMDGO_[A-Z_]+/g) ?? [])]
+  const named = [...new Set(docs.match(/CMDGO_[A-Z_]+/g) ?? [])]
   const unknown = named.filter((name) => !configSource.includes(name) && !testSource.includes(name))
-  assert.deepEqual(unknown, [], `README names env vars that nothing reads: ${unknown.join(', ')}`)
+  assert.deepEqual(unknown, [], `the docs name env vars that nothing reads: ${unknown.join(', ')}`)
 
   // The documented configuration surface is exactly what config.ts parses: nothing
   // missing, nothing invented.
   const implemented = [...new Set((configSource.match(/CMDGO_[A-Z_]+/g) ?? []))]
-  const undocumented = implemented.filter((name) => !readme.includes(name))
-  assert.deepEqual(undocumented, [], `src/config.ts reads env vars the README never mentions: ${undocumented.join(', ')}`)
+  const undocumented = implemented.filter((name) => !docs.includes(name))
+  assert.deepEqual(undocumented, [], `src/config.ts reads env vars the docs never mention: ${undocumented.join(', ')}`)
 })

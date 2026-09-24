@@ -167,12 +167,15 @@ test('the streamed path refuses unsupported parameters too', async () => {
   assert.equal(parsed.error.param, 'n')
 })
 
-test('the README lists the parameters that are refused', async () => {
+test('the docs list the parameters that are refused', async () => {
   // The audit's point was not only the 400 but the discoverability: a caller that
-  // never sends the field should still be able to read what is unsupported.
-  const readme = await readFile(join(process.cwd(), 'README.md'), 'utf8')
+  // never sends the field should still be able to read what is unsupported. The
+  // parameter table is user-facing, but the rationale moved to DEVELOPMENT.md, so
+  // both files are read as one text.
+  const read = (name) => readFile(join(process.cwd(), name), 'utf8')
+  const docs = `${await read('README.md')}\n${await read('DEVELOPMENT.md')}`
   for (const field of ['n', 'stop', 'response_format', 'tool_choice', 'parallel_tool_calls']) {
-    assert.ok(readme.includes(field), `README must document the unsupported parameter ${field}`)
+    assert.ok(docs.includes(field), `the docs must document the unsupported parameter ${field}`)
   }
-  assert.match(readme, /不支持|unsupported/i)
+  assert.match(docs, /不支持|unsupported/i)
 })

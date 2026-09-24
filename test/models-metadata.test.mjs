@@ -168,15 +168,18 @@ test('a failed first catalog sync leaves the list empty but does not crash', asy
   }
 })
 
-test('the README documents the catalog degradation semantics', async () => {
-  const readme = await readFile(join(process.cwd(), 'README.md'), 'utf8')
+test('the docs document the catalog degradation semantics', async () => {
+  // Degradation semantics span both documents: the user-facing consequence is in
+  // README.md and the full semantics plus field details are in DEVELOPMENT.md.
+  const read = (name) => readFile(join(process.cwd(), name), 'utf8')
+  const docs = `${await read('README.md')}\n${await read('DEVELOPMENT.md')}`
   // The dangerous inference is "empty list means nothing is callable".
-  assert.match(readme, /模型目录的降级语义/,
+  assert.match(docs, /模型目录的降级语义/,
     'the degradation behaviour must have its own documented section')
-  assert.match(readme, /保留上一次成功的结果/, 'a failed refresh keeps the previous catalog')
-  assert.match(readme, /首次启动就拉取失败时列表为空/, 'a failed first refresh yields an empty list')
-  assert.match(readme, /仍然可用/, 'an empty list does not mean chat is unavailable')
+  assert.match(docs, /保留上一次成功的结果/, 'a failed refresh keeps the previous catalog')
+  assert.match(docs, /首次启动就拉取失败时列表为空/, 'a failed first refresh yields an empty list')
+  assert.match(docs, /仍然可用/, 'an empty list does not mean chat is unavailable')
   // And the metadata semantics the fields now carry.
-  assert.match(readme, /目录同步时刻/, 'created semantics must be documented')
-  assert.match(readme, /前缀/, 'owned_by semantics must be documented')
+  assert.match(docs, /目录同步时刻/, 'created semantics must be documented')
+  assert.match(docs, /前缀/, 'owned_by semantics must be documented')
 })

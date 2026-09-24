@@ -196,9 +196,12 @@ test('the streamed path refuses before committing SSE headers', async () => {
   assert.equal(JSON.parse(res.body).error.code, 'context_length_exceeded')
 })
 
-test('the README documents the context check', async () => {
+test('the docs document the context check', async () => {
+  // The context-window behaviour is user-facing, but the engineering rationale for
+  // it lives in DEVELOPMENT.md, so both files are read as one text.
   const { readFile } = await import('node:fs/promises')
-  const readme = await readFile(join(process.cwd(), 'README.md'), 'utf8')
-  assert.match(readme, /context_length_exceeded/, 'the error code must be documented')
-  assert.match(readme, /上下文/, 'the context window behaviour must be explained')
+  const read = (name) => readFile(join(process.cwd(), name), 'utf8')
+  const docs = `${await read('README.md')}\n${await read('DEVELOPMENT.md')}`
+  assert.match(docs, /context_length_exceeded/, 'the error code must be documented')
+  assert.match(docs, /上下文/, 'the context window behaviour must be explained')
 })

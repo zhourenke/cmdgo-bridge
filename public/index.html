@@ -476,7 +476,7 @@ curl http://127.0.0.1:PORT/v1/chat/completions \
       }
       if (!window.confirm(
         '确定轮换客户端 API key？\n\n'
-        + '· 旧 token 会【立即失效】，所有下游（室友/朋友的 Agent 工具）需立刻换成新值\n'
+        + '· 旧 token 会【立即失效】，所有下游工具需立刻换成新值\n'
         + '· 新值会写入 config.json，无需重启\n'
         + '· 轮换不会影响上游 Command Code 账号的授权\n\n'
         + '建议先准备好把新 key 分发出去。')) return;
